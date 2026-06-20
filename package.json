@@ -12,8 +12,7 @@
     "skills": ["./skills"]
   },
   "dependencies": {
-    "agents-comm-bus": "*",
-    "@agents-comm-bus/pi-core": "0.1.0"
+    "@agents-comm-bus/pi-core": "git+https://github.com/remingtonspaz/agents-comm-bus-pi-core.git"
   },
   "bundledDependencies": ["@agents-comm-bus/pi-core"],
   "peerDependencies": {
@@ -23,5 +22,8 @@
     "typebox": "*"
   },
   "engines": { "node": ">=22" },
+  "scripts": {
+    "postinstall": "node ./scripts/postinstall.mjs"
+  },
   "license": "MIT"
 }
