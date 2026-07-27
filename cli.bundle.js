@@ -1340,14 +1340,14 @@ var require_receiver = __commonJS({
        * @return {(Error|RangeError)} The error
        * @private
        */
-      createError(ErrorCtor, message, prefix, statusCode, errorCode) {
+      createError(ErrorCtor, message, prefix, statusCode, errorCode2) {
         this._loop = false;
         this._errored = true;
         const err = new ErrorCtor(
           prefix ? `Invalid WebSocket frame: ${message}` : message
         );
         Error.captureStackTrace(err, this.createError);
-        err.code = errorCode;
+        err.code = errorCode2;
         err[kStatusCode] = statusCode;
         return err;
       }
@@ -3174,7 +3174,7 @@ var require_stream = __commonJS({
       };
       duplex._final = function(callback) {
         if (ws.readyState === ws.CONNECTING) {
-          ws.once("open", function open4() {
+          ws.once("open", function open3() {
             duplex._final(callback);
           });
           return;
@@ -3195,7 +3195,7 @@ var require_stream = __commonJS({
       };
       duplex._write = function(chunk, encoding, callback) {
         if (ws.readyState === ws.CONNECTING) {
-          ws.once("open", function open4() {
+          ws.once("open", function open3() {
             duplex._write(chunk, encoding, callback);
           });
           return;
@@ -3681,7 +3681,7 @@ import { createHash } from "node:crypto";
 
 // ../core-daemon/config.ts
 var DAEMON_NAME = "agents-comm-bus";
-var DAEMON_VERSION = "0.2.30";
+var DAEMON_VERSION = "0.2.41";
 var IPC_PROTOCOL_VERSION = "1.2.0";
 var IPC_HOST = "127.0.0.1";
 var DEFAULT_BOOTSTRAP_TIMEOUT_MS = 5e3;
@@ -3860,6 +3860,14 @@ var sessionDaemonOwnerMigration = {
     await ctx.exec(sql);
   }
 };
+var sessionLabelScopeMigration = {
+  version: 12,
+  description: "AGE-72: per-session comm account-label scoping",
+  async up(ctx) {
+    const sql = await readFile(join(schemaDir, "012_session_label_scope.sql"), "utf8");
+    await ctx.exec(sql);
+  }
+};
 async function runStorageMigrations(db) {
   await new SqliteMigrationRunner(db).apply([
     initialMigration,
@@ -3872,7 +3880,8 @@ async function runStorageMigrations(db) {
     conversationRegistrationKeyMigration,
     multiOpenQueriesMigration,
     durablePendingInboundMigration,
-    sessionDaemonOwnerMigration
+    sessionDaemonOwnerMigration,
+    sessionLabelScopeMigration
   ]);
 }
 
@@ -4353,11 +4362,12 @@ var SqliteStorage = class _SqliteStorage {
           lease_owner_daemon_discovery_root, lease_owner_daemon_checkout_root,
           lease_owner_daemon_state_root, lease_owner_daemon_bin,
           lease_owner_daemon_authority_rank,
-          most_recent_inbound_conversation_id, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          most_recent_inbound_conversation_id, account_label_scope, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id) DO UPDATE SET
           agent = excluded.agent,
           project = excluded.project,
+          account_label_scope = excluded.account_label_scope,
           status = excluded.status
       `).run(
       rec.schema_version,
@@ -4377,6 +4387,7 @@ var SqliteStorage = class _SqliteStorage {
       rec.lease_owner_daemon_bin,
       rec.lease_owner_daemon_authority_rank,
       rec.most_recent_inbound_conversation_id,
+      rec.account_label_scope ?? null,
       rec.status
     );
   }
@@ -4387,6 +4398,12 @@ var SqliteStorage = class _SqliteStorage {
           SET lease_holder_connection_id = ?,
               lease_acquired_at = ?,
               lease_released_at = NULL,
+              -- AGE-82: acquiring a lease revives the row. Registration is
+              -- upsert(active) + acquire, and the sweep can end the row in
+              -- between; without this a live lease would sit on an ended
+              -- row, invisible to every status='active' filter and outside
+              -- the partial live-lease indexes.
+              status = 'active',
               lease_owner_process_pid = ?,
               lease_owner_process_label = ?,
               lease_owner_process_registered_at = ?,
@@ -4441,6 +4458,39 @@ var SqliteStorage = class _SqliteStorage {
         WHERE session_id = ? AND lease_holder_connection_id = ?
       `).run(at, session, connection_id);
   }
+  async endSessionIfUnchanged(session, observed, at) {
+    const result = this.db.prepare(`
+        UPDATE sessions
+        SET status = 'ended',
+            lease_holder_connection_id = NULL,
+            lease_released_at = ?
+        WHERE session_id = ?
+          AND status = ?
+          AND (
+            (lease_holder_connection_id IS NULL AND ? IS NULL)
+            OR lease_holder_connection_id = ?
+          )
+          AND (
+            (lease_owner_process_pid IS NULL AND ? IS NULL)
+            OR lease_owner_process_pid = ?
+          )
+          AND (
+            (lease_owner_process_registered_at IS NULL AND ? IS NULL)
+            OR lease_owner_process_registered_at = ?
+          )
+      `).run(
+      at,
+      session,
+      observed.status,
+      observed.lease_holder_connection_id,
+      observed.lease_holder_connection_id,
+      observed.lease_owner_process_pid,
+      observed.lease_owner_process_pid,
+      observed.lease_owner_process_registered_at,
+      observed.lease_owner_process_registered_at
+    );
+    return Number(result.changes ?? 0) > 0;
+  }
   async getSession(session) {
     const row = this.db.prepare("SELECT * FROM sessions WHERE session_id = ?").get(session);
     return row ? this.sessionFromRow(row) : null;
@@ -4459,6 +4509,12 @@ var SqliteStorage = class _SqliteStorage {
     if (filter.status !== void 0) {
       where.push("status = ?");
       params.push(filter.status);
+    }
+    if (filter.account_label_scope === null) {
+      where.push("account_label_scope IS NULL");
+    } else if (filter.account_label_scope !== void 0) {
+      where.push("account_label_scope = ?");
+      params.push(filter.account_label_scope);
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db.prepare(`SELECT * FROM sessions ${whereClause} ORDER BY created_at DESC`).all(...params);
@@ -4678,6 +4734,7 @@ var SqliteStorage = class _SqliteStorage {
       lease_owner_daemon_bin: r.lease_owner_daemon_bin,
       lease_owner_daemon_authority_rank: r.lease_owner_daemon_authority_rank,
       most_recent_inbound_conversation_id: r.most_recent_inbound_conversation_id,
+      account_label_scope: r.account_label_scope ?? null,
       status: r.status
     };
   }
@@ -4688,6 +4745,66 @@ async function openSqliteStorage(path13) {
 function isConstraintError(error) {
   const sqliteError = error;
   return sqliteError.code === "SQLITE_CONSTRAINT" || sqliteError.code === "ERR_SQLITE_CONSTRAINT" || sqliteError.code === "ERR_SQLITE_ERROR" && sqliteError.errcode === 2067 || sqliteError.errstr === "constraint failed";
+}
+
+// ../core-daemon/cli/credential-input.ts
+import { readFile as readFile2 } from "node:fs/promises";
+async function resolveCredentialInput(options) {
+  const sources = [];
+  if (options.botToken) sources.push("--bot-token");
+  if (options.credentials) sources.push("credentials");
+  if (options.credentialsFile) sources.push("--credentials-file");
+  if (options.credentialsJson) sources.push("--credentials-json");
+  if (sources.length === 0) {
+    throw new Error(
+      "credentials are required; pass --bot-token, --credentials-file <path.json>, or --credentials-json <json>"
+    );
+  }
+  if (sources.length > 1) {
+    throw new Error(
+      `credential input is ambiguous; pass only one of ${sources.join(", ")}`
+    );
+  }
+  let credentials;
+  switch (sources[0]) {
+    case "--bot-token":
+      credentials = { botToken: options.botToken };
+      break;
+    case "credentials":
+      credentials = { ...options.credentials };
+      break;
+    case "--credentials-file":
+      credentials = await parseCredentialFile(options.credentialsFile);
+      break;
+    case "--credentials-json":
+      credentials = parseCredentialJson(options.credentialsJson, "--credentials-json");
+      break;
+    default:
+      throw new Error("unreachable credential input source");
+  }
+  return credentials;
+}
+async function parseCredentialFile(filePath) {
+  let raw;
+  try {
+    raw = await readFile2(filePath, "utf8");
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? String(error.code) : "UNKNOWN";
+    throw new Error(`could not read credentials file ${filePath}: ${code}`);
+  }
+  return parseCredentialJson(raw, `credentials file ${filePath}`);
+}
+function parseCredentialJson(raw, sourceLabel) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`${sourceLabel} is not valid JSON`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${sourceLabel} must be a JSON object`);
+  }
+  return parsed;
 }
 
 // ../node_modules/ws/wrapper.mjs
@@ -4874,7 +4991,7 @@ import path10 from "node:path";
 // ../core-daemon/bootstrap/ensure-daemon.ts
 import { spawn } from "node:child_process";
 import { closeSync, mkdirSync, openSync } from "node:fs";
-import { mkdir as mkdir3, readFile as readFile3, rm as rm2, writeFile } from "node:fs/promises";
+import { mkdir as mkdir3, readFile as readFile4, rm as rm2, writeFile } from "node:fs/promises";
 import path4 from "node:path";
 
 // ../core-daemon/storage/audit.ts
@@ -4928,7 +5045,7 @@ async function probeDaemon(options) {
 
 // ../core-daemon/bootstrap/spawn-lock.ts
 import { constants } from "node:fs";
-import { open as open2, mkdir as mkdir2, readFile as readFile2, rm } from "node:fs/promises";
+import { open as open2, mkdir as mkdir2, readFile as readFile3, rm } from "node:fs/promises";
 import path3 from "node:path";
 function parseSpawnLockToken(raw) {
   const trimmed = raw.trim();
@@ -4958,7 +5075,7 @@ function isTokenContentStale(token, options) {
 }
 async function removeSpawnLockIfTokenMatches(lockPath, expectedToken) {
   try {
-    const current = await readFile2(lockPath, "utf8");
+    const current = await readFile3(lockPath, "utf8");
     if (current.trim() !== expectedToken) {
       return false;
     }
@@ -4972,7 +5089,7 @@ async function removeStaleSpawnLock(lockPath, options = {}) {
   const resolved = resolveSpawnLockOptions(options);
   let observedRaw;
   try {
-    observedRaw = await readFile2(lockPath, "utf8");
+    observedRaw = await readFile3(lockPath, "utf8");
   } catch {
     return false;
   }
@@ -5209,7 +5326,7 @@ async function cleanupStalePidAndPort(input) {
 }
 async function readPortFile(portFile) {
   try {
-    const raw = (await readFile3(portFile, "utf8")).trim();
+    const raw = (await readFile4(portFile, "utf8")).trim();
     const port = Number(raw);
     return Number.isInteger(port) && port > 0 && port < 65536 ? port : void 0;
   } catch {
@@ -5218,7 +5335,7 @@ async function readPortFile(portFile) {
 }
 async function readPidFile(pidFile) {
   try {
-    const raw = (await readFile3(pidFile, "utf8")).trim();
+    const raw = (await readFile4(pidFile, "utf8")).trim();
     const pid = Number(raw);
     return Number.isInteger(pid) && pid > 0 ? pid : void 0;
   } catch {
@@ -5272,7 +5389,7 @@ function sleep(ms) {
 // ../core-daemon/host-runtime/ensure-central-install.ts
 import path8 from "node:path";
 import { existsSync as existsSync2 } from "node:fs";
-import { readFile as readFile6 } from "node:fs/promises";
+import { readFile as readFile7 } from "node:fs/promises";
 
 // ../core-daemon/host-runtime/run-central-install.ts
 import path7 from "node:path";
@@ -5467,7 +5584,7 @@ function join3(dir, name) {
 }
 
 // ../core-daemon/host-runtime/node-fs-seam.ts
-import { mkdir as mkdir4, copyFile, writeFile as writeFile2, rename, access, readFile as readFile4, chmod } from "node:fs/promises";
+import { mkdir as mkdir4, copyFile, writeFile as writeFile2, rename, access, readFile as readFile5, chmod } from "node:fs/promises";
 import path5 from "node:path";
 
 // ../core-daemon/host-runtime/strip-bom.ts
@@ -5516,7 +5633,7 @@ async function pathExists(p) {
 }
 async function readJsonOrNull(p) {
   try {
-    return JSON.parse(stripBom(await readFile4(p, "utf8")));
+    return JSON.parse(stripBom(await readFile5(p, "utf8")));
   } catch {
     return null;
   }
@@ -5535,50 +5652,64 @@ function resolveCentralPaths(stateRoot2, comm) {
 
 // ../core-daemon/host-runtime/install-lock.ts
 import { constants as constants2 } from "node:fs";
-import { open as open3, readFile as readFile5, rm as rm3, mkdir as mkdir5, stat } from "node:fs/promises";
+import { open as fsOpen, readFile as readFile6, rm as rm3, mkdir as mkdir5, stat } from "node:fs/promises";
 import path6 from "node:path";
 var DEFAULTS = { timeoutMs: 5e3, retryMs: 50, staleMs: 3e4 };
+var TRANSIENT_WIN32_OPEN_CODES = /* @__PURE__ */ new Set(["EPERM", "EBUSY", "EACCES"]);
 async function acquireInstallLock(lockPath, options = {}) {
   const timeoutMs = options.timeoutMs ?? DEFAULTS.timeoutMs;
   const retryMs = options.retryMs ?? DEFAULTS.retryMs;
   const staleMs = options.staleMs ?? DEFAULTS.staleMs;
   const now = options.now ?? Date.now;
   const sleep2 = options.sleep ?? defaultSleep;
+  const openFn = options.open ?? fsOpen;
+  const platform = options.platform ?? process.platform;
   await mkdir5(path6.dirname(lockPath), { recursive: true });
   const token = `${process.pid}:${now()}`;
   const start = now();
   let stoleStale = false;
   for (; ; ) {
+    let handle;
     try {
-      const handle = await open3(lockPath, constants2.O_CREAT | constants2.O_EXCL | constants2.O_WRONLY);
+      handle = await openFn(lockPath, constants2.O_CREAT | constants2.O_EXCL | constants2.O_WRONLY);
+    } catch (error) {
+      if (isAlreadyExistsError2(error)) {
+        if (await stealIfStale(lockPath, staleMs, now)) {
+          stoleStale = true;
+          continue;
+        }
+      } else if (!isTransientOpenError(error, platform)) {
+        throw error;
+      }
+      if (now() - start >= timeoutMs) {
+        throw lockTimeoutError(lockPath, timeoutMs, error);
+      }
+      await sleep2(retryMs);
+      continue;
+    }
+    try {
       await handle.writeFile(`${token}
 `, "utf8");
       await handle.close();
-      return {
-        path: lockPath,
-        token,
-        stoleStale,
-        release: async () => {
-          try {
-            const current = await readFile5(lockPath, "utf8");
-            if (current.trim() === token) {
-              await rm3(lockPath, { force: true });
-            }
-          } catch {
-          }
-        }
-      };
     } catch (error) {
-      if (!isAlreadyExistsError2(error)) throw error;
-      if (await stealIfStale(lockPath, staleMs, now)) {
-        stoleStale = true;
-        continue;
-      }
-      if (now() - start >= timeoutMs) {
-        throw new Error(`central install lock at ${lockPath} is held; timed out after ${timeoutMs}ms`);
-      }
-      await sleep2(retryMs);
+      await handle.close().catch(() => {
+      });
+      throw error;
     }
+    return {
+      path: lockPath,
+      token,
+      stoleStale,
+      release: async () => {
+        try {
+          const current = await readFile6(lockPath, "utf8");
+          if (current.trim() === token) {
+            await rm3(lockPath, { force: true });
+          }
+        } catch {
+        }
+      }
+    };
   }
 }
 async function stealIfStale(lockPath, staleMs, now) {
@@ -5596,7 +5727,30 @@ function defaultSleep(ms) {
   return new Promise((resolve3) => setTimeout(resolve3, ms));
 }
 function isAlreadyExistsError2(error) {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+  return errorCode(error) === "EEXIST";
+}
+function isTransientOpenError(error, platform) {
+  if (platform !== "win32") return false;
+  const code = errorCode(error);
+  return code !== null && TRANSIENT_WIN32_OPEN_CODES.has(code);
+}
+function errorCode(error) {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = error.code;
+    return typeof code === "string" ? code : null;
+  }
+  return null;
+}
+function lockTimeoutError(lockPath, timeoutMs, cause) {
+  const code = errorCode(cause);
+  if (code !== null && code !== "EEXIST") {
+    const error = new Error(
+      `central install lock at ${lockPath}: transient filesystem error ${code} persisted; timed out after ${timeoutMs}ms`
+    );
+    error.cause = cause;
+    return error;
+  }
+  return new Error(`central install lock at ${lockPath} is held; timed out after ${timeoutMs}ms`);
 }
 
 // ../core-daemon/host-runtime/run-central-install.ts
@@ -5631,7 +5785,7 @@ function resolveInstallMode(env) {
 }
 async function readInstallStamp(pluginInstallDir, deps = {}) {
   if (!pluginInstallDir) return null;
-  const read = deps.readFile ?? readFile6;
+  const read = deps.readFile ?? readFile7;
   try {
     const raw = await read(path8.join(pluginInstallDir, INSTALL_STAMP_NAME), "utf8");
     const parsed = JSON.parse(stripBom(raw));
@@ -5742,14 +5896,14 @@ import path9 from "node:path";
 var DEV_MARKER_NAME = ".agents-comm-bus-dev.json";
 function resolveDevConfig(projectRoot, deps = {}) {
   const exists = deps.exists ?? existsSync3;
-  const readFile10 = deps.readFile ?? ((p) => readFileSync(p, "utf8"));
+  const readFile11 = deps.readFile ?? ((p) => readFileSync(p, "utf8"));
   const markerPath = path9.join(projectRoot, DEV_MARKER_NAME);
   if (!exists(markerPath)) {
     return { env: {}, status: "none", reasons: [`no dev marker at ${markerPath}`] };
   }
   let parsed;
   try {
-    parsed = JSON.parse(stripBom(readFile10(markerPath)));
+    parsed = JSON.parse(stripBom(readFile11(markerPath)));
   } catch (error) {
     return {
       env: {},
@@ -5819,6 +5973,7 @@ async function entryEnsures(options) {
   const {
     agent,
     comm,
+    skipCentralInstall = false,
     stateRoot: stateRoot2,
     discoveryRoot: discoveryRoot2,
     fromDir,
@@ -5843,7 +5998,7 @@ async function entryEnsures(options) {
   const resolveStatePathsFn = deps.resolveStatePaths ?? resolveStatePaths;
   const canonicalStateRoot = stateRoot2 ?? resolvedEnv.AGENTS_COMM_BUS_ROOT ?? resolveStatePathsFn({ stateRoot: resolvedEnv.AGENTS_COMM_BUS_STATE_ROOT }).root;
   const canonicalDiscoveryRoot = ensureDaemonOptions.discoveryRoot ?? discoveryRoot2 ?? resolvedEnv.AGENTS_COMM_BUS_DISCOVERY_ROOT ?? canonicalStateRoot;
-  const centralInstall = await ensureCentralInstallFn({
+  const centralInstall = skipCentralInstall ? { mode: resolveInstallMode(resolvedEnv), skipped: true } : await ensureCentralInstallFn({
     stateRoot: canonicalStateRoot,
     agent,
     comm,
@@ -5876,6 +6031,10 @@ async function entryEnsures(options) {
 
 // ../core-daemon/cli/identity-probe.ts
 async function probeIdentityViaDaemon(options) {
+  const credentials = { ...options.credentials };
+  if (options.accountId && credentials.accountId === void 0) {
+    credentials.accountId = options.accountId;
+  }
   const daemon = await entryEnsures({
     // CLI identity probing is agent-agnostic; `agent` only scopes central-install
     // adapter selection. account-add always passes a concrete agent; the rare
@@ -5901,10 +6060,7 @@ async function probeIdentityViaDaemon(options) {
   try {
     const result = await connection.request("probe_comm_identity", {
       comm: options.comm,
-      credentials: {
-        botToken: options.botToken,
-        ...options.accountId ? { accountId: options.accountId } : {}
-      }
+      credentials
     });
     return parseProbeResult(result);
   } finally {
@@ -5928,7 +6084,7 @@ function parseProbeResult(result) {
 // ../core-daemon/cli/token-file.ts
 import { chmod as chmod2, mkdir as mkdir6, writeFile as writeFile3 } from "node:fs/promises";
 import path11 from "node:path";
-async function writeTokenFile(options) {
+async function writeCredentialsFile(options) {
   const tokenFile = resolveTokenFilePath({
     stateRoot: options.stateRoot,
     comm: options.comm,
@@ -5937,13 +6093,9 @@ async function writeTokenFile(options) {
     accountId: options.accountId
   });
   await mkdir6(path11.dirname(tokenFile), { recursive: true });
-  const body = {
-    botToken: options.botToken,
-    ...options.userId && options.userId.length > 0 ? { userId: options.userId } : {}
-  };
   await writeFile3(
     tokenFile,
-    `${JSON.stringify(body, null, 2)}
+    `${JSON.stringify(options.credentials, null, 2)}
 `,
     { encoding: "utf8", mode: 384 }
   );
@@ -5958,17 +6110,19 @@ async function writeTokenFile(options) {
 async function accountAdd(options) {
   const project = normalizeProjectPath(options.project);
   const comm = options.comm ?? "telegram";
-  const botToken = options.botToken;
-  if (!botToken) {
-    throw new Error("--bot-token is required for account-add");
-  }
-  const identity = await (options.probeIdentity ?? ((token, accountId) => probeIdentityViaDaemon({
+  const credentials = await resolveCredentialInput({
+    botToken: options.botToken,
+    credentials: options.credentials,
+    credentialsFile: options.credentialsFile,
+    credentialsJson: options.credentialsJson
+  });
+  const identity = await (options.probeIdentity ?? ((creds, accountId) => probeIdentityViaDaemon({
     comm,
-    botToken: token,
+    credentials: creds,
     accountId,
     agent: options.agent,
     stateRoot: options.stateRoot
-  })))(botToken, options.accountId);
+  })))(credentials, options.accountId);
   const paths = resolveStatePaths({ stateRoot: options.stateRoot });
   await mkdir7(paths.root, { recursive: true });
   const storage = await openSqliteStorage(paths.database);
@@ -5990,13 +6144,13 @@ async function accountAdd(options) {
         `${comm} bot id ${identity.bot_user_id} is already registered as project=${existing.project}, agent=${existing.agent}, account_label=${existing.account_label}; use account-list to inspect it or account-remove --comm ${comm} --bot-id ${identity.bot_user_id} before re-adding.`
       );
     }
-    const credentialsRef = await writeTokenFile({
+    const credentialsRef = await writeCredentialsFile({
       stateRoot: options.stateRoot,
       comm,
       project,
       agent: options.agent,
       accountId: identity.bot_user_id,
-      botToken
+      credentials
     });
     const now = Date.now();
     const registration = {
@@ -6018,6 +6172,56 @@ async function accountAdd(options) {
   } finally {
     await storage.close();
   }
+}
+
+// ../core-daemon/cli/redact.ts
+function redact(row) {
+  return { ...row, credentials_ref: row.credentials_ref ? "[redacted]" : row.credentials_ref };
+}
+
+// ../core-daemon/cli/account-lookup.ts
+async function accountLookup(options) {
+  const botToken = options.botToken;
+  if (!botToken) {
+    throw new Error("--bot-token is required");
+  }
+  const comm = options.comm ?? "telegram";
+  const identity = await (options.probeIdentity ?? ((creds, accountId) => probeIdentityViaDaemon({
+    comm,
+    credentials: creds,
+    accountId,
+    stateRoot: options.stateRoot
+  })))({ botToken }, options.accountId);
+  const storage = await openSqliteStorage(resolveStatePaths({ stateRoot: options.stateRoot }).database);
+  try {
+    const row = await storage.getAccountByBot(comm, identity.bot_user_id);
+    return {
+      registered: Boolean(row),
+      bot_user_id: identity.bot_user_id,
+      bot_username: identity.bot_username ?? null,
+      registration: row ? redact(row) : null
+    };
+  } finally {
+    await storage.close();
+  }
+}
+function formatAccountLookup(result) {
+  const lines = [
+    "agents-comm-bus account-lookup",
+    "",
+    `registered: ${result.registered ? "yes" : "no"}`,
+    `bot_user_id: ${result.bot_user_id}`,
+    `bot_username: ${result.bot_username ?? "(none)"}`
+  ];
+  if (result.registration) {
+    lines.push(
+      `project: ${result.registration.project}`,
+      `agent: ${result.registration.agent}`,
+      `comm: ${result.registration.comm}`,
+      `account_label: ${result.registration.account_label}`
+    );
+  }
+  return lines.join("\n");
 }
 
 // ../core-daemon/cli/account-list.ts
@@ -6137,16 +6341,19 @@ async function accountRemove(options) {
 import { rm as rm4 } from "node:fs/promises";
 async function accountUpdateToken(options) {
   const comm = options.comm ?? "telegram";
-  if (!options.botToken) {
-    throw new Error("--bot-token is required for account-update-token");
-  }
-  const identity = await (options.probeIdentity ?? ((token, accountId) => probeIdentityViaDaemon({
+  const credentials = await resolveCredentialInput({
+    botToken: options.botToken,
+    credentials: options.credentials,
+    credentialsFile: options.credentialsFile,
+    credentialsJson: options.credentialsJson
+  });
+  const identity = await (options.probeIdentity ?? ((creds, accountId) => probeIdentityViaDaemon({
     comm,
-    botToken: token,
+    credentials: creds,
     accountId,
     agent: options.agent,
     stateRoot: options.stateRoot
-  })))(options.botToken, options.accountId);
+  })))(credentials, options.accountId);
   const storage = await openSqliteStorage(resolveStatePaths({ stateRoot: options.stateRoot }).database);
   let wroteTokenRef = null;
   let wroteReplacementToken = false;
@@ -6172,13 +6379,13 @@ async function accountUpdateToken(options) {
         );
       }
     }
-    const credentialsRef = await writeTokenFile({
+    const credentialsRef = await writeCredentialsFile({
       stateRoot: options.stateRoot,
       comm,
       project: current.project,
       agent: current.agent,
       accountId: identity.bot_user_id,
-      botToken: options.botToken
+      credentials
     });
     wroteTokenRef = credentialsRef;
     wroteReplacementToken = botChanged;
@@ -6301,7 +6508,7 @@ async function allowlistAdd(options) {
 }
 
 // ../core-daemon/cli/allowlist-import.ts
-import { readFile as readFile7 } from "node:fs/promises";
+import { readFile as readFile8 } from "node:fs/promises";
 async function allowlistImportFromEnv(options = {}) {
   const comm = options.comm ?? "telegram";
   if (comm !== "telegram") {
@@ -6410,7 +6617,7 @@ function filePathFromCredentialsRef(ref, _project) {
 }
 async function readUserIdsFromJson(filePath) {
   try {
-    const raw = await readFile7(filePath, "utf8");
+    const raw = await readFile8(filePath, "utf8");
     const parsed = JSON.parse(raw);
     return normalizeUserIdField(parsed.userId);
   } catch {
@@ -6983,7 +7190,7 @@ if (invokedIsMigrateEntry && import.meta.url === invokedPath) {
 }
 
 // ../core-daemon/cli/reload-helper.ts
-import { readFile as readFile8 } from "node:fs/promises";
+import { readFile as readFile9 } from "node:fs/promises";
 async function reloadDaemonRegistrations(options = {}) {
   const statePaths = resolveStatePaths({
     stateRoot: process.env.AGENTS_COMM_BUS_ROOT ?? process.env.AGENTS_COMM_BUS_STATE_ROOT
@@ -7020,7 +7227,7 @@ async function reloadDaemonRegistrations(options = {}) {
 }
 async function readPortFile2(portFile) {
   try {
-    const raw = (await readFile8(portFile, "utf8")).trim();
+    const raw = (await readFile9(portFile, "utf8")).trim();
     const port = Number(raw);
     return Number.isInteger(port) && port > 0 && port < 65536 ? port : void 0;
   } catch {
@@ -7029,7 +7236,7 @@ async function readPortFile2(portFile) {
 }
 
 // ../core-daemon/cli/status.ts
-import { readdir, readFile as readFile9 } from "node:fs/promises";
+import { readdir, readFile as readFile10 } from "node:fs/promises";
 import os2 from "node:os";
 import path12 from "node:path";
 async function daemonStatus(options = {}) {
@@ -7149,7 +7356,7 @@ function formatDaemonStatus(snapshot) {
 }
 async function readPidFile2(pidFile) {
   try {
-    const raw = (await readFile9(pidFile, "utf8")).trim();
+    const raw = (await readFile10(pidFile, "utf8")).trim();
     const pid = Number(raw);
     return Number.isInteger(pid) && pid > 0 ? pid : void 0;
   } catch {
@@ -7158,7 +7365,7 @@ async function readPidFile2(pidFile) {
 }
 async function readPortFile3(portFile) {
   try {
-    const raw = (await readFile9(portFile, "utf8")).trim();
+    const raw = (await readFile10(portFile, "utf8")).trim();
     const port = Number(raw);
     return Number.isInteger(port) && port > 0 && port < 65536 ? port : void 0;
   } catch {
@@ -7187,7 +7394,7 @@ async function listCommLeasesForPid(pid) {
       if (!file.endsWith(".json")) continue;
       const filePath = path12.join(commDir, file);
       try {
-        const record = JSON.parse(await readFile9(filePath, "utf8"));
+        const record = JSON.parse(await readFile10(filePath, "utf8"));
         if (record.pid !== pid) continue;
         out.push({
           comm: record.comm_id,
@@ -7229,7 +7436,7 @@ async function listWatcherPids(stateRoot2) {
   for (const sessionKey of sessionDirs) {
     const pidFile = path12.join(sessionsDir, sessionKey, "watcher.pid");
     try {
-      const raw = (await readFile9(pidFile, "utf8")).trim();
+      const raw = (await readFile10(pidFile, "utf8")).trim();
       const pid = Number(raw);
       out.push({
         session_key: sessionKey,
@@ -7258,6 +7465,8 @@ async function main() {
         accountLabel: required(args.accountLabel ?? args["account-label"], "--account-label"),
         comm: args.comm,
         botToken: args.botToken ?? args["bot-token"],
+        credentialsFile: args.credentialsFile ?? args["credentials-file"],
+        credentialsJson: args.credentialsJson ?? args["credentials-json"],
         accountId: args.accountId ?? args["account-id"]
       });
       const reload = await reloadDaemonRegistrations();
@@ -7271,6 +7480,20 @@ async function main() {
         comm: args.comm
       });
       console.log(JSON.stringify(rows.map(redact), null, 2));
+      return;
+    }
+    case "account-lookup": {
+      const result = await accountLookup({
+        comm: args.comm,
+        botToken: args.botToken ?? args["bot-token"],
+        accountId: args.accountId ?? args["account-id"],
+        stateRoot: args.stateRoot ?? args["state-root"]
+      });
+      if (args.json !== void 0 || args["json"] !== void 0) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatAccountLookup(result));
+      }
       return;
     }
     case "account-remove": {
@@ -7308,7 +7531,9 @@ async function main() {
         accountLabel: args.accountLabel ?? args["account-label"],
         agent: args.agent,
         project: args.project,
-        botToken: required(args.botToken ?? args["bot-token"], "--bot-token"),
+        botToken: args.botToken ?? args["bot-token"],
+        credentialsFile: args.credentialsFile ?? args["credentials-file"],
+        credentialsJson: args.credentialsJson ?? args["credentials-json"],
         accountId: args.accountId ?? args["account-id"],
         allowBotChange: args.allowBotChange !== void 0 || args["allow-bot-change"] !== void 0
       });
@@ -7435,18 +7660,16 @@ function required(value, label) {
   if (!value) throw new Error(`${label} is required`);
   return value;
 }
-function redact(row) {
-  return { ...row, credentials_ref: row.credentials_ref ? "[redacted]" : row.credentials_ref };
-}
 function printHelp2() {
   console.error(`agents-comm-bus CLI
 
 Account commands:
-  agents-comm-bus account-add --project <path> --agent <agent> --account-label <label> --bot-token <token> [--comm <comm>] [--account-id <id>]
+  agents-comm-bus account-add --project <path> --agent <agent> --account-label <label> (--bot-token <token> | --credentials-file <path.json> | --credentials-json <json>) [--comm <comm>] [--account-id <id>]
   agents-comm-bus account-list [--project <path>] [--agent <agent>] [--comm telegram]
+  agents-comm-bus account-lookup --bot-token <token> [--comm telegram] [--account-id <id>] [--json]
   agents-comm-bus account-remove [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>])
   agents-comm-bus account-relabel [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>]) --new-account-label <label>
-  agents-comm-bus account-update-token [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>]) --bot-token <token> [--account-id <id>] [--allow-bot-change]
+  agents-comm-bus account-update-token [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>]) (--bot-token <token> | --credentials-file <path.json> | --credentials-json <json>) [--account-id <id>] [--allow-bot-change]
 
 Allowlist commands:
   agents-comm-bus allowlist add    --comm <c> --user <id> [--note "..."]                                                      # global
@@ -7460,7 +7683,8 @@ Diagnostics:
   agents-comm-bus status [--json] [--state-root <path>] [--discovery-root <path>]
 
 --bot-id is canonical for per-bot commands. Label selectors are accepted only when they resolve to exactly one account.
-account-add stores --bot-token in a daemon-owned file ref; credentials_ref is not user-supplied.
+account-add and account-update-token store credentials in a daemon-owned file ref; credentials_ref is not user-supplied.
+Pass exactly one of --bot-token, --credentials-file, or --credentials-json. --bot-token is shorthand for {"botToken":"<value>"}.
 --account-id sets an explicit synthetic account id for comms without a probeable platform identity (e.g. curl, default curl:local); comms that probe a real identity ignore it.
 `);
 }

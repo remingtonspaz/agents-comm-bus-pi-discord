@@ -3658,7 +3658,7 @@ import os3 from "node:os";
 
 // ../core-daemon/config.ts
 var DAEMON_NAME = "agents-comm-bus";
-var DAEMON_VERSION = "0.2.30";
+var DAEMON_VERSION = "0.2.41";
 var IPC_PROTOCOL_VERSION = "1.2.0";
 var IPC_HOST = "127.0.0.1";
 function protocolMajor(version) {
@@ -3839,6 +3839,8 @@ var CommLeaseArbiter = class {
    * denial logs again.
    */
   lastDenyAudit = /* @__PURE__ */ new Map();
+  /** AGE-36: runtime-local inventory of leases this arbiter currently holds. */
+  heldLeases = /* @__PURE__ */ new Set();
   constructor(options) {
     this.self = options.self;
     this.lastIpcServedAt = options.lastIpcServedAt;
@@ -3851,6 +3853,20 @@ var CommLeaseArbiter = class {
   }
   get authorityRank() {
     return this.self.authorityRank;
+  }
+  /** Count of `(comm, resource)` leases this arbiter currently owns. */
+  heldLeaseCount() {
+    return this.heldLeases.size;
+  }
+  /** Snapshot of held lease keys — for retirement eligibility and tests. */
+  heldLeaseSnapshot() {
+    return [...this.heldLeases].map((key) => {
+      const sep = key.indexOf(":");
+      return {
+        comm_id: key.slice(0, sep),
+        resource_id: key.slice(sep + 1)
+      };
+    });
   }
   /**
    * Attempt to acquire (or reclaim) the lease for `(commId, resourceId)`. Reads
@@ -3912,6 +3928,7 @@ var CommLeaseArbiter = class {
           previous_holder_rank: existing?.authorityRank ?? null
         }
       });
+      this.heldLeases.add(this.leaseKey(commId, resourceId));
       return { ok: true, record };
     } finally {
       await this.releaseGuard(leasePath, guard);
@@ -3931,11 +3948,13 @@ var CommLeaseArbiter = class {
       if (holder && holder.pid === this.self.pid) {
         return { ok: true, record: holder };
       }
+      this.heldLeases.delete(this.leaseKey(commId, resourceId));
       return { ok: false, reason: "lost", holder };
     }
     try {
       const existing = await this.readRecord(leasePath);
       if (!existing || existing.pid !== this.self.pid) {
+        this.heldLeases.delete(this.leaseKey(commId, resourceId));
         this.audit({
           kind: "comm_lease_lost",
           comm_id: commId,
@@ -3959,9 +3978,10 @@ var CommLeaseArbiter = class {
       await this.releaseGuard(leasePath, guard);
     }
   }
-  /** Delete the lease file, but only if it is still self's. Best-effort. */
+  /** Delete the lease file when still self's; always drop local held inventory. */
   async release(commId, resourceId) {
     const leasePath = this.leasePath(commId, resourceId);
+    const key = this.leaseKey(commId, resourceId);
     const guard = await this.acquireGuard(leasePath);
     try {
       const existing = await this.readRecord(leasePath);
@@ -3975,11 +3995,15 @@ var CommLeaseArbiter = class {
         });
       }
     } finally {
+      this.heldLeases.delete(key);
       if (guard) await this.releaseGuard(leasePath, guard);
     }
   }
   leasePath(commId, resourceId) {
     return commLeasePath(commId, resourceId, this.homeDir);
+  }
+  leaseKey(commId, resourceId) {
+    return `${commId}:${resourceId}`;
   }
   buildRecord(commId, resourceId, existing) {
     const now = this.now();
@@ -4362,7 +4386,12 @@ async function startIpcServer(options = {}) {
   const daemonVersion = options.daemonVersion ?? DAEMON_VERSION;
   const metadata = options.metadata ?? {};
   const server = new import_websocket_server.default({ host, port });
+  let liveConnectionCount = 0;
   server.on("connection", (socket) => {
+    liveConnectionCount += 1;
+    socket.once("close", () => {
+      liveConnectionCount -= 1;
+    });
     handleHandshake(socket, { protocolVersion, daemonVersion, metadata, onRequest: options.onRequest });
   });
   await new Promise((resolve, reject) => {
@@ -4380,6 +4409,7 @@ async function startIpcServer(options = {}) {
     host,
     url: `ws://${host}:${boundPort}`,
     hello,
+    getLiveConnectionCount: () => liveConnectionCount,
     close: () => new Promise((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
     })
@@ -4663,7 +4693,9 @@ async function writeDaemonDiscoveryFiles(input) {
 // ../core-daemon/bootstrap/boot-scope-restore.ts
 import { access } from "node:fs/promises";
 import { join as join2 } from "node:path";
-var DEFAULT_BOOT_RESTORE_RECENCY_MS = 24 * 60 * 60 * 1e3;
+
+// ../core-daemon/runtime/session-owner-liveness.ts
+var DEFAULT_SESSION_OWNER_RECENCY_MS = 24 * 60 * 60 * 1e3;
 function defaultIsPidAlive2(pid) {
   try {
     process.kill(pid, 0);
@@ -4672,6 +4704,23 @@ function defaultIsPidAlive2(pid) {
     return false;
   }
 }
+function classifySessionOwnerProcess(session, options = {}) {
+  const pid = session.lease_owner_process_pid;
+  const registeredAt = session.lease_owner_process_registered_at;
+  if (pid == null || registeredAt == null) return "no_owner";
+  const isPidAlive2 = options.isPidAlive ?? defaultIsPidAlive2;
+  if (!isPidAlive2(pid)) return "dead";
+  const now = options.now ?? Date.now;
+  const recencyMs = options.recencyMs ?? DEFAULT_SESSION_OWNER_RECENCY_MS;
+  if (now() - registeredAt > recencyMs) return "stale";
+  return "live";
+}
+function createSessionOwnerLiveness(options = {}) {
+  return (session) => session.lease_holder_connection_id != null || classifySessionOwnerProcess(session, options) === "live";
+}
+
+// ../core-daemon/bootstrap/boot-scope-restore.ts
+var DEFAULT_BOOT_RESTORE_RECENCY_MS = DEFAULT_SESSION_OWNER_RECENCY_MS;
 async function defaultPathExists(path8) {
   try {
     await access(path8);
@@ -4680,8 +4729,8 @@ async function defaultPathExists(path8) {
     return false;
   }
 }
-function scopeDedupeKey(agent, project) {
-  return `${agent}:${normalizeProjectPath(project)}`;
+function scopeDedupeKey(agent, project, accountLabelScope) {
+  return `${agent}:${normalizeProjectPath(project)}:${accountLabelScope ?? ""}`;
 }
 function classifySessionDaemonOwner(session, currentDiscoveryRoot) {
   const stamped = session.lease_owner_daemon_discovery_root;
@@ -4730,19 +4779,23 @@ async function runBootScopeRestore(input) {
     summary.candidates = sessions.length;
     const scopesToRestore = /* @__PURE__ */ new Map();
     for (const session of sessions) {
-      const pid = session.lease_owner_process_pid;
-      const registeredAt = session.lease_owner_process_registered_at;
-      if (pid == null || registeredAt == null) {
-        summary.skipped_no_owner += 1;
-        continue;
-      }
-      if (now() - registeredAt > recencyMs) {
-        summary.skipped_stale += 1;
-        continue;
-      }
-      if (!isPidAlive2(pid)) {
-        summary.skipped_dead += 1;
-        continue;
+      const ownerState = classifySessionOwnerProcess(session, {
+        now,
+        isPidAlive: isPidAlive2,
+        recencyMs
+      });
+      switch (ownerState) {
+        case "no_owner":
+          summary.skipped_no_owner += 1;
+          continue;
+        case "stale":
+          summary.skipped_stale += 1;
+          continue;
+        case "dead":
+          summary.skipped_dead += 1;
+          continue;
+        case "live":
+          break;
       }
       const ownerClass = classifySessionDaemonOwner(session, input.discoveryRoot);
       if (ownerClass === "missing") {
@@ -4754,14 +4807,20 @@ async function runBootScopeRestore(input) {
         continue;
       }
       const canonicalProject = normalizeProjectPath(session.project);
-      const key = scopeDedupeKey(session.agent, canonicalProject);
+      const key = scopeDedupeKey(session.agent, canonicalProject, session.account_label_scope);
       if (!scopesToRestore.has(key)) {
-        scopesToRestore.set(key, { project: canonicalProject, agent: session.agent });
+        scopesToRestore.set(key, {
+          project: canonicalProject,
+          agent: session.agent,
+          accountLabelScope: session.account_label_scope
+        });
       }
     }
     for (const scope of scopesToRestore.values()) {
       try {
-        await input.ensureCommsForSession(scope.project, scope.agent);
+        await input.ensureCommsForSession(scope.project, scope.agent, {
+          accountLabelScope: scope.accountLabelScope
+        });
         summary.restored += 1;
       } catch (error) {
         console.error(
@@ -4783,8 +4842,118 @@ async function runBootScopeRestore(input) {
   }
 }
 
+// ../core-daemon/bootstrap/daemon-retirement.ts
+import { readFile as readFile3, rm as rm3 } from "node:fs/promises";
+var IDLE_NO_OWNED_RESOURCES_REASON = "idle_no_owned_resources";
+function discoveryFilesMatchSelf(input) {
+  return input.onDiskPid === input.selfPid && input.onDiskPort === input.selfPort;
+}
+async function removeDiscoveryFilesIfOwned(input) {
+  const paths = resolveDiscoveryPaths({
+    stateRoot: input.stateRoot,
+    discoveryRoot: input.discoveryRoot
+  });
+  const readPid = input.readPidFile ?? readDiscoveryPidFile;
+  const readPort = input.readPortFile ?? readDiscoveryPortFile;
+  const onDiskPid = await readPid(paths.pidFile);
+  const onDiskPort = await readPort(paths.portFile);
+  if (!discoveryFilesMatchSelf({
+    selfPid: input.selfPid,
+    selfPort: input.selfPort,
+    onDiskPid,
+    onDiskPort
+  })) {
+    return false;
+  }
+  await rm3(paths.pidFile, { force: true });
+  await rm3(paths.portFile, { force: true });
+  return true;
+}
+var globalRetiring = false;
+async function retireDaemon(options) {
+  if (globalRetiring) return false;
+  globalRetiring = true;
+  const selfPid = options.selfPid ?? process.pid;
+  const log = options.log ?? ((message) => console.error(message));
+  const exit = options.exitProcess ?? ((code) => process.exit(code));
+  try {
+    bestEffortSync(options.stopTimers, "stop daemon retirement timers");
+    await appendRetirementAudit(options.audit, options.reason, selfPid, options.port);
+    log(
+      `agents-comm-bus: retiring daemon pid=${selfPid} port=${options.port} reason=${options.reason}`
+    );
+    await bestEffort(options.stopBus, "stop comm adapters during daemon retirement");
+    await bestEffort(options.closeIpc, "close IPC server during daemon retirement");
+    await bestEffort(options.closeStorage, "close storage during daemon retirement");
+    const removeDiscovery = options.removeDiscoveryFiles ?? removeDiscoveryFilesIfOwned;
+    await bestEffort(
+      () => removeDiscovery({
+        stateRoot: options.stateRoot,
+        discoveryRoot: options.discoveryRoot,
+        selfPid,
+        selfPort: options.port
+      }).then(() => void 0),
+      "remove discovery files during daemon retirement"
+    );
+  } catch (error) {
+    log(
+      `agents-comm-bus: daemon retirement failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  } finally {
+    exit(0);
+  }
+  return true;
+}
+async function appendRetirementAudit(audit, reason, selfPid, port) {
+  if (!audit) return;
+  await audit.append({
+    timestamp: Date.now(),
+    kind: "daemon_retired",
+    detail: { reason, self_pid: selfPid, port }
+  }).catch(() => {
+  });
+}
+async function bestEffort(action, label) {
+  if (!action) return;
+  try {
+    await action();
+  } catch (error) {
+    console.error(
+      `agents-comm-bus: failed to ${label}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+function bestEffortSync(action, label) {
+  if (!action) return;
+  try {
+    action();
+  } catch (error) {
+    console.error(
+      `agents-comm-bus: failed to ${label}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+async function readDiscoveryPidFile(pidFile) {
+  try {
+    const raw = (await readFile3(pidFile, "utf8")).trim();
+    const pid = Number(raw);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+async function readDiscoveryPortFile(portFile) {
+  try {
+    const raw = (await readFile3(portFile, "utf8")).trim();
+    const port = Number(raw);
+    return Number.isInteger(port) && port > 0 && port < 65536 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
 // ../core-daemon/bootstrap/pid-watchdog.ts
-import { readFile as readFile3 } from "node:fs/promises";
+import { readFile as readFile4 } from "node:fs/promises";
 function startDaemonPidWatchdog(options) {
   const intervalMs = options.intervalMs ?? 3e4;
   const initialDelayMs = options.initialDelayMs ?? 5e3;
@@ -4933,7 +5102,7 @@ async function checkDaemonPidOwnership(options) {
 }
 async function readPidFile(pidFile) {
   try {
-    const raw = (await readFile3(pidFile, "utf8")).trim();
+    const raw = (await readFile4(pidFile, "utf8")).trim();
     const pid = Number(raw);
     if (Number.isInteger(pid) && pid > 0) return { status: "pid", pid };
     return { status: "invalid", raw };
@@ -4963,6 +5132,165 @@ function errorMessage(error) {
 
 // ../core-daemon/bus.ts
 import crypto from "node:crypto";
+
+// ../core-daemon/session-label-scope.ts
+function parseAgentsCommLabels(raw) {
+  if (raw === void 0 || raw === null) return null;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return null;
+  const map = {};
+  for (const entry of trimmed.split(",")) {
+    const piece = entry.trim();
+    if (piece.length === 0) {
+      throw new Error(`AGENTS_COMM_LABELS contains an empty entry in "${raw}"`);
+    }
+    const colon = piece.indexOf(":");
+    if (colon <= 0 || colon === piece.length - 1) {
+      throw new Error(
+        `AGENTS_COMM_LABELS entry "${piece}" is malformed; expected comm:label`
+      );
+    }
+    const comm = piece.slice(0, colon).trim();
+    const label = piece.slice(colon + 1).trim();
+    if (comm.length === 0 || label.length === 0) {
+      throw new Error(
+        `AGENTS_COMM_LABELS entry "${piece}" is malformed; expected comm:label`
+      );
+    }
+    if (map[comm] !== void 0) {
+      throw new Error(`AGENTS_COMM_LABELS lists comm "${comm}" more than once`);
+    }
+    map[comm] = label;
+  }
+  return map;
+}
+function serializeAccountLabelScope(scope) {
+  if (!scope || Object.keys(scope).length === 0) return null;
+  const sorted = Object.keys(scope).sort();
+  const canonical = {};
+  for (const comm of sorted) {
+    canonical[comm] = scope[comm];
+  }
+  return JSON.stringify(canonical);
+}
+function parseAccountLabelScope(stored) {
+  if (stored === void 0 || stored === null) return null;
+  const trimmed = stored.trim();
+  if (trimmed.length === 0) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error(`account_label_scope is not valid JSON: ${stored}`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`account_label_scope must be a JSON object: ${stored}`);
+  }
+  const map = {};
+  for (const [comm, label] of Object.entries(parsed)) {
+    if (typeof label !== "string" || label.length === 0) {
+      throw new Error(`account_label_scope value for "${comm}" must be a non-empty string`);
+    }
+    map[comm] = label;
+  }
+  return map;
+}
+function accountLabelScopeFromParams(params) {
+  if (params.account_label_scope === null) return null;
+  if (typeof params.account_label_scope === "string") {
+    return serializeAccountLabelScope(parseAccountLabelScope(params.account_label_scope));
+  }
+  if (typeof params.comm_labels === "string") {
+    return serializeAccountLabelScope(parseAgentsCommLabels(params.comm_labels));
+  }
+  return null;
+}
+function filterRegistrationsByScope(registrations, scopeStored) {
+  const scope = parseRoutingScope(scopeStored);
+  if (scope === void 0) return [];
+  if (!scope) return [...registrations];
+  return registrations.filter((reg) => {
+    const expected = scope[reg.comm];
+    return expected !== void 0 && reg.account_label === expected;
+  });
+}
+function liveSessionScopeCandidates(target, sessions, isSessionLive) {
+  const liveSiblings = sessions.filter(
+    (session) => session.session_id !== target.session_id && session.project === target.project && session.agent === target.agent && session.status === "active" && isSessionLive(session)
+  );
+  return [target, ...liveSiblings];
+}
+function filterRegistrationsForSession(registrations, target, sessions, isSessionLive = hasLiveConnectionLease) {
+  if (target.account_label_scope != null) {
+    return filterRegistrationsByScope(
+      registrations,
+      target.account_label_scope
+    );
+  }
+  const labeledSiblings = liveSessionScopeCandidates(
+    target,
+    sessions,
+    isSessionLive
+  ).filter(
+    (session) => session.session_id !== target.session_id && session.account_label_scope != null
+  );
+  if (labeledSiblings.length === 0) return [...registrations];
+  return registrations.filter(
+    (registration) => !labeledSiblings.some(
+      (session) => registrationMatchesConversationScope(
+        session.account_label_scope,
+        registration
+      )
+    )
+  );
+}
+function sessionOwnsConversation(target, sessions, conversation, isSessionLive = hasLiveConnectionLease) {
+  if (conversation.project !== target.project || conversation.agent !== target.agent) {
+    return false;
+  }
+  const resolved = resolveSessionForConversation(
+    liveSessionScopeCandidates(target, sessions, isSessionLive),
+    conversation,
+    (session) => session.session_id
+  );
+  return resolved?.session_id === target.session_id;
+}
+function registrationMatchesConversationScope(scopeStored, conversation) {
+  const scope = parseRoutingScope(scopeStored);
+  if (scope === void 0) return false;
+  if (!scope) return true;
+  const expected = scope[conversation.comm];
+  return expected !== void 0 && expected === conversation.account_label;
+}
+function resolveSessionForConversation(sessions, conversation, pickSessionId) {
+  const labeledMatches = sessions.filter(
+    (sess) => sess.account_label_scope != null && registrationMatchesConversationScope(sess.account_label_scope, conversation)
+  );
+  if (labeledMatches.length > 0) {
+    return labeledMatches[0];
+  }
+  const unlabeled = sessions.filter((sess) => sess.account_label_scope == null);
+  if (unlabeled.length === 1) {
+    return unlabeled[0];
+  }
+  if (unlabeled.length > 1) {
+    return void 0;
+  }
+  return void 0;
+}
+function hasLiveConnectionLease(session) {
+  return session.lease_holder_connection_id != null;
+}
+function parseRoutingScope(stored) {
+  try {
+    return parseAccountLabelScope(stored ?? null);
+  } catch (error) {
+    console.error(
+      `agents-comm-bus: invalid persisted account_label_scope; treating session as scope-inert: ${error instanceof Error ? error.message : String(error)}`
+    );
+    return void 0;
+  }
+}
 
 // ../packages/core-contracts/dist/types.js
 var SCHEMA_VERSION_QUERY = 1;
@@ -5034,6 +5362,7 @@ var MessageBus = class {
   constructor(options) {
     this.options = options;
     this.now = options.now ?? Date.now;
+    this.sessionOwnerIsLive = options.sessionOwnerIsLive ?? createSessionOwnerLiveness();
     for (const comm of options.comms ?? []) {
       this.registerComm(comm);
     }
@@ -5048,6 +5377,7 @@ var MessageBus = class {
   comms = /* @__PURE__ */ new Map();
   seen = new RecentSeenCache();
   now;
+  sessionOwnerIsLive;
   dispatchSink = null;
   resolveSinks = [];
   registerComm(comm) {
@@ -5504,6 +5834,21 @@ var MessageBus = class {
     }
     const conversation = await this.options.storage.getConversation(conversationId);
     if (!conversation) throw new Error(`conversation not found: ${conversationId}`);
+    const sessions = record ? await this.options.storage.listSessions({
+      project: record.project,
+      agent: record.agent,
+      status: "active"
+    }) : [];
+    if (record && !sessionOwnsConversation(
+      record,
+      sessions,
+      conversation,
+      this.sessionOwnerIsLive
+    )) {
+      throw new Error(
+        `session ${session} does not own most-recent inbound conversation ${conversationId} (${conversation.comm}:${conversation.account_label})`
+      );
+    }
     const botUserId = await this.botUserIdForConversation(conversation);
     return {
       ...chatRefFromConversation(conversation),
@@ -5664,7 +6009,7 @@ function adapterKey(commId, accountId) {
 import { createRequire } from "node:module";
 
 // ../core-daemon/storage/schema/runner.ts
-import { readFile as readFile4 } from "node:fs/promises";
+import { readFile as readFile5 } from "node:fs/promises";
 import { dirname as dirname2, join as join3 } from "node:path";
 import { fileURLToPath } from "node:url";
 var SqliteMigrationRunner = class {
@@ -5693,7 +6038,7 @@ var initialMigration = {
   version: 1,
   description: "initial storage schema",
   async up(ctx) {
-    const sql = await readFile4(join3(schemaDir, "001_initial.sql"), "utf8");
+    const sql = await readFile5(join3(schemaDir, "001_initial.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -5701,7 +6046,7 @@ var conversationAgentIdentityMigration = {
   version: 2,
   description: "include agent in conversation identity",
   async up(ctx) {
-    const sql = await readFile4(join3(schemaDir, "002_conversation_agent_identity.sql"), "utf8");
+    const sql = await readFile5(join3(schemaDir, "002_conversation_agent_identity.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -5709,7 +6054,7 @@ var allowlistMigration = {
   version: 3,
   description: "add allowlist_global and allowlist_per_bot tables",
   async up(ctx) {
-    const sql = await readFile4(join3(schemaDir, "003_allowlist.sql"), "utf8");
+    const sql = await readFile5(join3(schemaDir, "003_allowlist.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -5717,7 +6062,7 @@ var sessionOwnerProcessMigration = {
   version: 4,
   description: "track owning agent process for session leases",
   async up(ctx) {
-    const sql = await readFile4(join3(schemaDir, "004_session_owner_process.sql"), "utf8");
+    const sql = await readFile5(join3(schemaDir, "004_session_owner_process.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -5725,7 +6070,7 @@ var conversationBotIdentityMigration = {
   version: 5,
   description: "store receiving bot identity on conversations",
   async up(ctx) {
-    const sql = await readFile4(join3(schemaDir, "005_conversation_bot_identity.sql"), "utf8");
+    const sql = await readFile5(join3(schemaDir, "005_conversation_bot_identity.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -5733,7 +6078,7 @@ var registrationIdentityMigration = {
   version: 6,
   description: "add immutable registration_id surrogate to registrations + conversations",
   async up(ctx) {
-    const sql = await readFile4(join3(schemaDir, "006_registration_identity.sql"), "utf8");
+    const sql = await readFile5(join3(schemaDir, "006_registration_identity.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -5741,7 +6086,7 @@ var registrationPkMigration = {
   version: 7,
   description: "make registration_id the canonical primary key of account_registrations",
   async up(ctx) {
-    const sql = await readFile4(join3(schemaDir, "007_registration_pk.sql"), "utf8");
+    const sql = await readFile5(join3(schemaDir, "007_registration_pk.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -5749,7 +6094,7 @@ var conversationRegistrationKeyMigration = {
   version: 8,
   description: "re-key conversations on (registration_id, chat, thread) + drop account_label",
   async up(ctx) {
-    const sql = await readFile4(join3(schemaDir, "008_conversation_registration_key.sql"), "utf8");
+    const sql = await readFile5(join3(schemaDir, "008_conversation_registration_key.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -5757,7 +6102,7 @@ var multiOpenQueriesMigration = {
   version: 9,
   description: "AGE-9: drop the one-open-query-per-session unique index (policy moves to callers)",
   async up(ctx) {
-    const sql = await readFile4(join3(schemaDir, "009_multi_open_queries.sql"), "utf8");
+    const sql = await readFile5(join3(schemaDir, "009_multi_open_queries.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -5765,7 +6110,7 @@ var durablePendingInboundMigration = {
   version: 10,
   description: "AGE-56: durable pending inbound delivery rows",
   async up(ctx) {
-    const sql = await readFile4(join3(schemaDir, "010_durable_pending_inbound.sql"), "utf8");
+    const sql = await readFile5(join3(schemaDir, "010_durable_pending_inbound.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -5773,7 +6118,15 @@ var sessionDaemonOwnerMigration = {
   version: 11,
   description: "AGE-58: stamp daemon-instance identity on session leases",
   async up(ctx) {
-    const sql = await readFile4(join3(schemaDir, "011_session_daemon_owner.sql"), "utf8");
+    const sql = await readFile5(join3(schemaDir, "011_session_daemon_owner.sql"), "utf8");
+    await ctx.exec(sql);
+  }
+};
+var sessionLabelScopeMigration = {
+  version: 12,
+  description: "AGE-72: per-session comm account-label scoping",
+  async up(ctx) {
+    const sql = await readFile5(join3(schemaDir, "012_session_label_scope.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -5789,7 +6142,8 @@ async function runStorageMigrations(db) {
     conversationRegistrationKeyMigration,
     multiOpenQueriesMigration,
     durablePendingInboundMigration,
-    sessionDaemonOwnerMigration
+    sessionDaemonOwnerMigration,
+    sessionLabelScopeMigration
   ]);
 }
 
@@ -6270,11 +6624,12 @@ var SqliteStorage = class _SqliteStorage {
           lease_owner_daemon_discovery_root, lease_owner_daemon_checkout_root,
           lease_owner_daemon_state_root, lease_owner_daemon_bin,
           lease_owner_daemon_authority_rank,
-          most_recent_inbound_conversation_id, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          most_recent_inbound_conversation_id, account_label_scope, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id) DO UPDATE SET
           agent = excluded.agent,
           project = excluded.project,
+          account_label_scope = excluded.account_label_scope,
           status = excluded.status
       `).run(
       rec.schema_version,
@@ -6294,6 +6649,7 @@ var SqliteStorage = class _SqliteStorage {
       rec.lease_owner_daemon_bin,
       rec.lease_owner_daemon_authority_rank,
       rec.most_recent_inbound_conversation_id,
+      rec.account_label_scope ?? null,
       rec.status
     );
   }
@@ -6304,6 +6660,12 @@ var SqliteStorage = class _SqliteStorage {
           SET lease_holder_connection_id = ?,
               lease_acquired_at = ?,
               lease_released_at = NULL,
+              -- AGE-82: acquiring a lease revives the row. Registration is
+              -- upsert(active) + acquire, and the sweep can end the row in
+              -- between; without this a live lease would sit on an ended
+              -- row, invisible to every status='active' filter and outside
+              -- the partial live-lease indexes.
+              status = 'active',
               lease_owner_process_pid = ?,
               lease_owner_process_label = ?,
               lease_owner_process_registered_at = ?,
@@ -6358,6 +6720,39 @@ var SqliteStorage = class _SqliteStorage {
         WHERE session_id = ? AND lease_holder_connection_id = ?
       `).run(at, session, connection_id);
   }
+  async endSessionIfUnchanged(session, observed, at) {
+    const result = this.db.prepare(`
+        UPDATE sessions
+        SET status = 'ended',
+            lease_holder_connection_id = NULL,
+            lease_released_at = ?
+        WHERE session_id = ?
+          AND status = ?
+          AND (
+            (lease_holder_connection_id IS NULL AND ? IS NULL)
+            OR lease_holder_connection_id = ?
+          )
+          AND (
+            (lease_owner_process_pid IS NULL AND ? IS NULL)
+            OR lease_owner_process_pid = ?
+          )
+          AND (
+            (lease_owner_process_registered_at IS NULL AND ? IS NULL)
+            OR lease_owner_process_registered_at = ?
+          )
+      `).run(
+      at,
+      session,
+      observed.status,
+      observed.lease_holder_connection_id,
+      observed.lease_holder_connection_id,
+      observed.lease_owner_process_pid,
+      observed.lease_owner_process_pid,
+      observed.lease_owner_process_registered_at,
+      observed.lease_owner_process_registered_at
+    );
+    return Number(result.changes ?? 0) > 0;
+  }
   async getSession(session) {
     const row = this.db.prepare("SELECT * FROM sessions WHERE session_id = ?").get(session);
     return row ? this.sessionFromRow(row) : null;
@@ -6376,6 +6771,12 @@ var SqliteStorage = class _SqliteStorage {
     if (filter.status !== void 0) {
       where.push("status = ?");
       params.push(filter.status);
+    }
+    if (filter.account_label_scope === null) {
+      where.push("account_label_scope IS NULL");
+    } else if (filter.account_label_scope !== void 0) {
+      where.push("account_label_scope = ?");
+      params.push(filter.account_label_scope);
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db.prepare(`SELECT * FROM sessions ${whereClause} ORDER BY created_at DESC`).all(...params);
@@ -6595,6 +6996,7 @@ var SqliteStorage = class _SqliteStorage {
       lease_owner_daemon_bin: r.lease_owner_daemon_bin,
       lease_owner_daemon_authority_rank: r.lease_owner_daemon_authority_rank,
       most_recent_inbound_conversation_id: r.most_recent_inbound_conversation_id,
+      account_label_scope: r.account_label_scope ?? null,
       status: r.status
     };
   }
@@ -6768,6 +7170,223 @@ function createCommFactoryRegistry(input) {
   };
 }
 
+// ../core-daemon/runtime/daemon-idle-reaper.ts
+var DEFAULT_IDLE_REAPER_GRACE_MS = 9e4;
+var DEFAULT_IDLE_REAPER_INTERVAL_MS = 5e3;
+function sampleStructuralEligibility(input) {
+  const heldLeases = input.heldLeaseCount();
+  const liveIpcConnections = input.liveIpcConnectionCount();
+  const pendingInbound = input.pendingInboundLength();
+  const inFlightAdapters = input.inFlightAdapterCount();
+  const rawBridgeBlockers = input.bridgeBlockers();
+  const bridgeBlockers = {};
+  for (const [agentId, snapshot] of Object.entries(rawBridgeBlockers)) {
+    if (snapshot) bridgeBlockers[agentId] = snapshot;
+  }
+  const ipcQuietForGrace = input.now - input.lastIpcServedAt >= input.graceMs;
+  const reasons = [];
+  if (heldLeases > 0) reasons.push("held_leases");
+  if (liveIpcConnections > 0) reasons.push("live_ipc_connections");
+  if (pendingInbound > 0) reasons.push("pending_inbound");
+  if (inFlightAdapters > 0) reasons.push("in_flight_adapters");
+  if (Object.keys(bridgeBlockers).length > 0) reasons.push("bridge_blockers");
+  return {
+    structurallyEligible: reasons.length === 0,
+    blockers: {
+      held_leases: heldLeases,
+      live_ipc_connections: liveIpcConnections,
+      pending_inbound: pendingInbound,
+      in_flight_adapters: inFlightAdapters,
+      bridge_blockers: bridgeBlockers,
+      ipc_quiet_for_grace: ipcQuietForGrace
+    },
+    reasons
+  };
+}
+function shouldIdleReaperRetire(input) {
+  if (!input.structurallyEligible || input.structuralEligibleSince === null) return false;
+  return input.now - input.structuralEligibleSince >= input.graceMs && input.now - input.lastIpcServedAt >= input.graceMs;
+}
+function startIdleReaper(options) {
+  const graceMs = options.graceMs ?? DEFAULT_IDLE_REAPER_GRACE_MS;
+  const intervalMs = options.intervalMs ?? DEFAULT_IDLE_REAPER_INTERVAL_MS;
+  const nowFn = options.now ?? Date.now;
+  const setIntervalFn = options.setIntervalFn ?? ((fn, ms) => {
+    const handle = setInterval(fn, ms);
+    handle.unref?.();
+    return handle;
+  });
+  const clearIntervalFn = options.clearIntervalFn ?? ((h) => clearInterval(h));
+  const setTimeoutFn = options.setTimeoutFn ?? ((fn, ms) => {
+    const handle = setTimeout(fn, ms);
+    handle.unref?.();
+    return handle;
+  });
+  const clearTimeoutFn = options.clearTimeoutFn ?? ((h) => clearTimeout(h));
+  const log = options.log ?? (() => {
+  });
+  let structuralEligibleSince = null;
+  let retired = false;
+  let interval = null;
+  const tick = () => {
+    if (retired) return;
+    const now = nowFn();
+    const structural = sampleStructuralEligibility({
+      now,
+      lastIpcServedAt: options.lastIpcServedAt(),
+      graceMs,
+      heldLeaseCount: options.heldLeaseCount,
+      liveIpcConnectionCount: options.liveIpcConnectionCount,
+      pendingInboundLength: options.pendingInboundLength,
+      inFlightAdapterCount: options.inFlightAdapterCount,
+      bridgeBlockers: options.bridgeBlockers
+    });
+    if (!structural.structurallyEligible) {
+      structuralEligibleSince = null;
+      return;
+    }
+    if (structuralEligibleSince === null) {
+      structuralEligibleSince = now;
+    }
+    if (shouldIdleReaperRetire({
+      now,
+      graceMs,
+      structuralEligibleSince,
+      lastIpcServedAt: options.lastIpcServedAt(),
+      structurallyEligible: true
+    })) {
+      retired = true;
+      log(
+        `agents-comm-bus: idle reaper retiring daemon after ${graceMs}ms with no owned resources (structural blockers cleared at ${new Date(structuralEligibleSince).toISOString()})`
+      );
+      void Promise.resolve(options.retire()).catch((error) => {
+        console.error(
+          `agents-comm-bus: idle reaper retire failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      });
+    }
+  };
+  const initialDelayMs = options.initialDelayMs ?? intervalMs;
+  const initial = setTimeoutFn(() => {
+    tick();
+    interval = setIntervalFn(tick, intervalMs);
+  }, initialDelayMs);
+  return {
+    stop() {
+      clearTimeoutFn(initial);
+      if (interval != null) clearIntervalFn(interval);
+      interval = null;
+    }
+  };
+}
+
+// ../core-daemon/runtime/session-end-sweep.ts
+var DEFAULT_SESSION_END_SWEEP_INTERVAL_MS = 60 * 60 * 1e3;
+function sessionEndObservation(session) {
+  return {
+    status: session.status,
+    lease_holder_connection_id: session.lease_holder_connection_id,
+    lease_owner_process_pid: session.lease_owner_process_pid,
+    lease_owner_process_registered_at: session.lease_owner_process_registered_at
+  };
+}
+function shouldSweepEndSession(session, options = {}) {
+  const ownerState = classifySessionOwnerProcess(session, options);
+  if (ownerState === "live" || ownerState === "stale") return false;
+  if (ownerState === "no_owner") {
+    return session.lease_holder_connection_id == null;
+  }
+  return true;
+}
+async function runSessionEndSweep(input) {
+  const counts = {
+    ended: 0,
+    kept_live: 0,
+    kept_stale: 0,
+    kept_no_owner_leased: 0,
+    cas_lost: 0
+  };
+  const livenessOptions = {
+    now: input.now,
+    isPidAlive: input.isPidAlive,
+    recencyMs: input.recencyMs
+  };
+  const at = (input.now ?? Date.now)();
+  const sessions = await input.storage.listSessions({ status: "active" });
+  for (const session of sessions) {
+    const ownerState = classifySessionOwnerProcess(session, livenessOptions);
+    if (!shouldSweepEndSession(session, livenessOptions)) {
+      if (ownerState === "live") counts.kept_live += 1;
+      else if (ownerState === "stale") counts.kept_stale += 1;
+      else if (ownerState === "no_owner" && session.lease_holder_connection_id != null) {
+        counts.kept_no_owner_leased += 1;
+      }
+      continue;
+    }
+    const ended = await input.storage.endSessionIfUnchanged(
+      session.session_id,
+      sessionEndObservation(session),
+      at
+    );
+    if (ended) counts.ended += 1;
+    else counts.cas_lost += 1;
+  }
+  const log = input.log ?? (() => {
+  });
+  log(
+    `agents-comm-bus: session end sweep: ended=${counts.ended} kept_live=${counts.kept_live} kept_stale=${counts.kept_stale} kept_no_owner_leased=${counts.kept_no_owner_leased} cas_lost=${counts.cas_lost}`
+  );
+  return counts;
+}
+function startSessionEndSweep(options) {
+  const intervalMs = options.intervalMs ?? DEFAULT_SESSION_END_SWEEP_INTERVAL_MS;
+  const setIntervalFn = options.setIntervalFn ?? ((fn, ms) => {
+    const handle = setInterval(fn, ms);
+    handle.unref?.();
+    return handle;
+  });
+  const clearIntervalFn = options.clearIntervalFn ?? ((h) => clearInterval(h));
+  const setTimeoutFn = options.setTimeoutFn ?? ((fn, ms) => {
+    const handle = setTimeout(fn, ms);
+    handle.unref?.();
+    return handle;
+  });
+  const clearTimeoutFn = options.clearTimeoutFn ?? ((h) => clearTimeout(h));
+  let sweepInFlight = false;
+  let interval = null;
+  const tick = () => {
+    if (sweepInFlight) return;
+    sweepInFlight = true;
+    void runSessionEndSweep({
+      storage: options.storage,
+      now: options.now,
+      isPidAlive: options.isPidAlive,
+      recencyMs: options.recencyMs,
+      log: options.log
+    }).catch((error) => {
+      const log = options.log ?? console.error;
+      log(
+        `agents-comm-bus: session end sweep failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }).finally(() => {
+      sweepInFlight = false;
+    });
+  };
+  if (options.runOnStart !== false) {
+    tick();
+  }
+  const initial = setTimeoutFn(() => {
+    interval = setIntervalFn(tick, intervalMs);
+  }, intervalMs);
+  return {
+    stop() {
+      clearTimeoutFn(initial);
+      if (interval != null) clearIntervalFn(interval);
+      interval = null;
+    }
+  };
+}
+
 // ../core-daemon/runtime/durable-inbound.ts
 function durableInboundKey(entry) {
   return deliveryKey(
@@ -6920,6 +7539,7 @@ async function runDaemon(options) {
   const audit = new JsonlAuditStore(paths.root);
   const blobs = new ContentAddressedBlobStore(paths.root);
   const pendingInbound = [];
+  const sessionOwnerIsLive = createSessionOwnerLiveness();
   const daemonBin = env.AGENTS_COMM_BUS_BIN ?? process.argv[1] ?? null;
   const { authorityRank, checkoutRoot } = inferAuthorityRank({
     env,
@@ -6956,7 +7576,8 @@ async function runDaemon(options) {
     transcripts,
     audit,
     blobs,
-    comms
+    comms,
+    sessionOwnerIsLive
   });
   const bridges = [];
   const inFlightAdapters = /* @__PURE__ */ new Set();
@@ -6981,13 +7602,15 @@ async function runDaemon(options) {
       registerCommIpcMethods(ipcMethods, factory, ipcDeps, { commIdByMethod });
     }
   }
-  const ensureCommsForSessionFn = async (project, agent) => {
+  const ensureCommsForSessionFn = async (project, agent, options2) => {
     const canonicalProject = normalizeProjectPath(project);
-    activeScopes.add(scopeKey(agent, canonicalProject));
+    const accountLabelScope = options2?.accountLabelScope ?? null;
+    activeScopes.add(scopeKey(agent, canonicalProject, accountLabelScope));
     await ensureCommsForSession({
       project: canonicalProject,
       requestedProject: project,
       agent,
+      accountLabelScope,
       factories: commAdapterFactories,
       rescanFactories: rescanFactoriesForComm,
       bus,
@@ -7023,7 +7646,8 @@ async function runDaemon(options) {
           stateRoot: paths.root,
           daemonBin,
           authorityRank
-        }
+        },
+        sessionOwnerIsLive
       })
     )
   );
@@ -7083,7 +7707,7 @@ async function runDaemon(options) {
                 queue_length: pendingInbound.length
               }
             });
-            await bridge.onInboundConversation(conversation);
+            await bridge.onInboundConversation(conversation, message);
             await audit.append({
               timestamp: Date.now(),
               kind: "inbound_dispatch_bridge_completed",
@@ -7177,24 +7801,66 @@ async function runDaemon(options) {
     throw error;
   }
   await bus.start();
-  startDaemonPidWatchdog({
+  const collectBridgeBlockers = () => {
+    const blockers = {};
+    for (const bridge of bridges) {
+      blockers[bridge.agentId] = bridge.getRetirementBlockers?.() ?? null;
+    }
+    return blockers;
+  };
+  let pidWatchdogHandle = null;
+  let idleReaperHandle = null;
+  let sessionEndSweepHandle = null;
+  const runDaemonRetirement = async (reason, recordAudit) => {
+    await retireDaemon({
+      reason,
+      port: server.port,
+      stateRoot: paths.root,
+      discoveryRoot: discoveryPaths.root,
+      audit: recordAudit ? audit : void 0,
+      stopTimers: () => {
+        pidWatchdogHandle?.stop();
+        idleReaperHandle?.stop();
+        sessionEndSweepHandle?.stop();
+      },
+      stopBus: () => bestEffortWithTimeout(
+        () => bus.stop(),
+        5e3,
+        "stop comm adapters during daemon retirement"
+      ),
+      closeIpc: () => bestEffortWithTimeout(
+        () => server.close(),
+        1e3,
+        "close IPC server during daemon retirement"
+      ),
+      closeStorage: () => storage.close()
+    });
+  };
+  pidWatchdogHandle = startDaemonPidWatchdog({
     stateRoot: paths.root,
     discoveryRoot: discoveryPaths.root,
     pidFile: discoveryPaths.pidFile,
     port: server.port,
     audit,
     stopDaemon: async () => {
-      await bestEffortWithTimeout(
-        () => bus.stop(),
-        5e3,
-        "stop comm adapters during daemon retirement"
-      );
-      await bestEffortWithTimeout(
-        () => server.close(),
-        1e3,
-        "close IPC server during daemon retirement"
-      );
+      await runDaemonRetirement("daemon_superseded", false);
     }
+  });
+  idleReaperHandle = startIdleReaper({
+    lastIpcServedAt: () => ipcActivity.value,
+    heldLeaseCount: () => leaseArbiter.heldLeaseCount(),
+    liveIpcConnectionCount: () => server.getLiveConnectionCount(),
+    pendingInboundLength: () => pendingInbound.length,
+    inFlightAdapterCount: () => inFlightAdapters.size,
+    bridgeBlockers: collectBridgeBlockers,
+    retire: async () => {
+      await runDaemonRetirement(IDLE_NO_OWNED_RESOURCES_REASON, true);
+    },
+    log: (message) => console.error(message)
+  });
+  sessionEndSweepHandle = startSessionEndSweep({
+    storage,
+    log: (message) => console.error(message)
   });
   void runBootScopeRestore({
     stateRoot: paths.root,
@@ -7230,7 +7896,7 @@ async function bestEffortWithTimeout(action, timeoutMs, label) {
   }
 }
 async function addAdapterForRegistration(input) {
-  const adapter = await createAdapterFromRegistration({
+  const { adapter, resolution } = await createAdapterFromRegistration({
     factory: input.factory,
     registration: input.registration,
     env: input.env,
@@ -7240,7 +7906,14 @@ async function addAdapterForRegistration(input) {
     leaseArbiter: input.leaseArbiter
   });
   if (!adapter) {
-    return { ok: false, reason: unresolvedCredentialsReason(input.registration.credentials_ref) };
+    if (resolution.status === "invalid") {
+      logInvalidCredentialResolution(input.registration, input.factory.commId, resolution);
+    }
+    return {
+      ok: false,
+      reason: resolution.status === "invalid" ? resolution.reason : unresolvedCredentialsReason(input.registration.credentials_ref),
+      resolution
+    };
   }
   const accountId = input.registration.bot_user_id;
   try {
@@ -7259,16 +7932,35 @@ async function addAdapterForRegistration(input) {
     }
     return {
       ok: false,
-      reason: `failed to start adapter: ${error instanceof Error ? error.message : String(error)}`
+      reason: `failed to start adapter: ${error instanceof Error ? error.message : String(error)}`,
+      resolution
     };
   }
 }
 async function ensureCommsForSession(input) {
   const project = normalizeProjectPath(input.project);
-  const registrations = await input.storage.listAccountRegistrations({
+  const accountLabelScope = input.accountLabelScope ?? null;
+  const allRegistrations = await input.storage.listAccountRegistrations({
     project,
     agent: input.agent
   });
+  const registrations = filterRegistrationsByScope(allRegistrations, accountLabelScope);
+  if (accountLabelScope && registrations.length === 0) {
+    const message = `agents-comm-bus: account_label_scope ${accountLabelScope} has no matching account registrations for project=${project} agent=${input.agent}`;
+    console.error(message);
+    await input.audit?.append({
+      timestamp: Date.now(),
+      kind: "account_label_scope_miss",
+      agent: input.agent,
+      detail: {
+        project,
+        account_label_scope: accountLabelScope,
+        registration_count: allRegistrations.length
+      }
+    }).catch(() => {
+    });
+    throw new Error(message);
+  }
   if (registrations.length === 0) {
     await reportRegistrationProjectNearMiss({
       agent: input.agent,
@@ -7324,22 +8016,31 @@ async function ensureCommsForSession(input) {
         leaseArbiter: input.leaseArbiter
       });
       if (!result.ok) {
-        console.error(
-          `agents-comm-bus: ensureCommsForSession could not start ${key}: ${result.reason}`
-        );
-        await input.audit?.append({
-          timestamp: Date.now(),
-          kind: "comm_adapter_skip",
-          agent: input.agent,
-          detail: {
-            comm: registration.comm,
-            account_id: registration.bot_user_id,
-            account_label: registration.account_label,
-            project,
-            reason: result.reason
-          }
-        }).catch(() => {
-        });
+        if (result.resolution.status === "invalid") {
+          await appendCredentialResolutionFailedAudit(
+            input.audit,
+            registration,
+            factory.commId,
+            result.resolution
+          );
+        } else {
+          console.error(
+            `agents-comm-bus: ensureCommsForSession could not start ${key}: ${result.reason}`
+          );
+          await input.audit?.append({
+            timestamp: Date.now(),
+            kind: "comm_adapter_skip",
+            agent: input.agent,
+            detail: {
+              comm: registration.comm,
+              account_id: registration.bot_user_id,
+              account_label: registration.account_label,
+              project,
+              reason: result.reason
+            }
+          }).catch(() => {
+          });
+        }
       }
     } finally {
       input.inFlight.delete(key);
@@ -7351,12 +8052,8 @@ async function createAdapterFromRegistration(input) {
     storage: input.storage,
     stateRoot: input.stateRoot
   });
-  if (!resolved) {
-    const reason = unresolvedCredentialsReason(input.registration.credentials_ref);
-    console.error(
-      `agents-comm-bus: skipping ${input.factory.commId} account ${input.registration.account_label} for project ${input.registration.project} (${reason})`
-    );
-    return null;
+  if (resolved.status !== "ok") {
+    return { adapter: null, resolution: resolved };
   }
   const adapter = input.factory.create(
     resolved.credentials,
@@ -7367,9 +8064,9 @@ async function createAdapterFromRegistration(input) {
     }
   );
   if (adapter.exclusiveResource?.() != null) {
-    return wrapWithLease(adapter, input.leaseArbiter);
+    return { adapter: wrapWithLease(adapter, input.leaseArbiter), resolution: resolved };
   }
-  return adapter;
+  return { adapter, resolution: resolved };
 }
 async function reloadAdapters(input) {
   const added = [];
@@ -7385,7 +8082,7 @@ async function reloadAdapters(input) {
     const regs = await input.storage.listAccountRegistrations({ comm: factory.commId });
     for (const reg of regs) {
       const key = adapterMapKey(factory.commId, reg.bot_user_id);
-      const scopeActive = input.activeScopes?.has(scopeKey(reg.agent, reg.project)) ?? false;
+      const scopeActive = input.activeScopes != null && isRegistrationScopeActive(reg, input.activeScopes);
       if (!current.has(key) && !scopeActive) continue;
       if (!desired.has(key)) desired.set(key, { factory, registration: reg });
     }
@@ -7414,20 +8111,29 @@ async function reloadAdapters(input) {
         account_id: entry.registration.bot_user_id,
         reason: result.reason
       });
-      await input.audit?.append({
-        timestamp: Date.now(),
-        kind: "comm_adapter_skip",
-        agent: entry.registration.agent,
-        detail: {
-          comm: entry.registration.comm,
-          account_id: entry.registration.bot_user_id,
-          account_label: entry.registration.account_label,
-          project: entry.registration.project,
-          reason: result.reason,
-          via: "reload_registrations"
-        }
-      }).catch(() => {
-      });
+      if (result.resolution.status === "invalid") {
+        await appendCredentialResolutionFailedAudit(
+          input.audit,
+          entry.registration,
+          entry.registration.comm,
+          result.resolution
+        );
+      } else {
+        await input.audit?.append({
+          timestamp: Date.now(),
+          kind: "comm_adapter_skip",
+          agent: entry.registration.agent,
+          detail: {
+            comm: entry.registration.comm,
+            account_id: entry.registration.bot_user_id,
+            account_label: entry.registration.account_label,
+            project: entry.registration.project,
+            reason: result.reason,
+            via: "reload_registrations"
+          }
+        }).catch(() => {
+        });
+      }
     }
   }
   for (const [key, entry] of current) {
@@ -7455,7 +8161,7 @@ async function reloadAdapters(input) {
   for (const [key, entry] of desired) {
     if (!current.has(key)) continue;
     if (forceCredentialRefresh.has(key)) {
-      const adapter = await createAdapterFromRegistration({
+      const { adapter, resolution } = await createAdapterFromRegistration({
         factory: entry.factory,
         registration: entry.registration,
         env: input.env,
@@ -7465,10 +8171,19 @@ async function reloadAdapters(input) {
         leaseArbiter: input.leaseArbiter
       });
       if (!adapter) {
+        if (resolution.status === "invalid") {
+          logInvalidCredentialResolution(entry.registration, entry.registration.comm, resolution);
+          await appendCredentialResolutionFailedAudit(
+            input.audit,
+            entry.registration,
+            entry.registration.comm,
+            resolution
+          );
+        }
         skipped.push({
           comm: entry.registration.comm,
           account_id: entry.registration.bot_user_id,
-          reason: unresolvedCredentialsReason(entry.registration.credentials_ref, "re-resolve")
+          reason: resolution.status === "invalid" ? resolution.reason : unresolvedCredentialsReason(entry.registration.credentials_ref, "re-resolve")
         });
         continue;
       }
@@ -7547,11 +8262,20 @@ async function reloadAdapters(input) {
       storage: input.storage,
       stateRoot: input.stateRoot
     });
-    if (!resolved) {
+    if (resolved.status !== "ok") {
+      if (resolved.status === "invalid") {
+        logInvalidCredentialResolution(entry.registration, entry.registration.comm, resolved);
+        await appendCredentialResolutionFailedAudit(
+          input.audit,
+          entry.registration,
+          entry.registration.comm,
+          resolved
+        );
+      }
       skipped.push({
         comm: entry.registration.comm,
         account_id: entry.registration.bot_user_id,
-        reason: unresolvedCredentialsReason(entry.registration.credentials_ref, "re-resolve")
+        reason: resolved.status === "invalid" ? resolved.reason : unresolvedCredentialsReason(entry.registration.credentials_ref, "re-resolve")
       });
       continue;
     }
@@ -7576,10 +8300,13 @@ async function resolveOwnedAccountKeys(storage, session) {
   if (typeof session !== "string" || session.length === 0) return void 0;
   const sess = await storage.getSession(session);
   if (!sess) return /* @__PURE__ */ new Set();
-  const regs = await storage.listAccountRegistrations({
-    project: sess.project,
-    agent: sess.agent
-  });
+  const regs = filterRegistrationsByScope(
+    await storage.listAccountRegistrations({
+      project: sess.project,
+      agent: sess.agent
+    }),
+    sess.account_label_scope
+  );
   return new Set(regs.map((reg) => `${reg.comm}:${reg.bot_user_id}`));
 }
 function sameStringSet(a, b) {
@@ -7596,11 +8323,46 @@ function unresolvedCredentialsReason(ref, action = "resolve") {
   }
   return `could not ${action} credentials_ref=${ref}`;
 }
+function logInvalidCredentialResolution(registration, commId, resolution) {
+  const pathSuffix = resolution.path ? ` [${resolution.path}]` : "";
+  console.error(
+    `agents-comm-bus: credential file for ${commId} account ${registration.account_label} (project ${registration.project}) exists but failed to resolve: ${resolution.reason}${pathSuffix}`
+  );
+}
+async function appendCredentialResolutionFailedAudit(audit, registration, commId, resolution) {
+  await audit?.append({
+    timestamp: Date.now(),
+    kind: "credential_resolution_failed",
+    agent: registration.agent,
+    detail: {
+      comm: commId,
+      account_label: registration.account_label,
+      project: registration.project,
+      bot_user_id: registration.bot_user_id,
+      credential_path: resolution.path ?? null,
+      failure_kind: resolution.failureKind,
+      reason: resolution.reason
+    }
+  }).catch(() => {
+  });
+}
 function adapterMapKey(commId, accountId) {
   return `${commId}:${accountId}`;
 }
-function scopeKey(agent, project) {
-  return `${agent}:${normalizeProjectPath(project)}`;
+function scopeKey(agent, project, accountLabelScope) {
+  return `${agent}:${normalizeProjectPath(project)}:${accountLabelScope ?? ""}`;
+}
+function isRegistrationScopeActive(registration, activeScopes) {
+  const prefix = `${registration.agent}:${normalizeProjectPath(registration.project)}:`;
+  const legacyKey = `${registration.agent}:${normalizeProjectPath(registration.project)}`;
+  for (const key of activeScopes) {
+    if (key === legacyKey) return true;
+    if (!key.startsWith(prefix)) continue;
+    const scopeStored = key.slice(prefix.length);
+    const scope = scopeStored.length > 0 ? scopeStored : null;
+    if (filterRegistrationsByScope([registration], scope).length > 0) return true;
+  }
+  return false;
 }
 async function reportRegistrationProjectNearMiss(input) {
   const allForAgent = await input.storage.listAccountRegistrations({ agent: input.agent });
@@ -7643,7 +8405,8 @@ async function handleEnsureCommsForScope(params, ensureCommsForSession2) {
   }
   const agent = typeof params.agent === "string" && params.agent.trim() !== "" ? params.agent : "claude";
   const canonicalProject = normalizeProjectPath(rawProject);
-  await ensureCommsForSession2(canonicalProject, agent);
+  const accountLabelScope = typeof params.account_label_scope === "string" || params.account_label_scope === null ? params.account_label_scope : null;
+  await ensureCommsForSession2(canonicalProject, agent, { accountLabelScope });
   return { ok: true, project: canonicalProject, agent };
 }
 async function dispatchIpc(request, context) {
@@ -7727,7 +8490,7 @@ function parseReloadOptions(params) {
 }
 
 // ../core-daemon/bridges/claude/bridge.ts
-import crypto2 from "node:crypto";
+import crypto3 from "node:crypto";
 
 // ../core-daemon/runtime/agent-bridge.ts
 function sessionLeaseOwnerWithDaemon(ownerFromParams, daemonOwner) {
@@ -7745,6 +8508,7 @@ function sessionLeaseOwnerWithDaemon(ownerFromParams, daemonOwner) {
 }
 
 // ../core-daemon/bridges/claude/wake.ts
+import crypto2 from "node:crypto";
 import { mkdir as mkdir7, writeFile as writeFile2 } from "node:fs/promises";
 import os4 from "node:os";
 import path4 from "node:path";
@@ -7756,21 +8520,50 @@ function hashProjectKey(projectPath) {
   }
   return hash.toString(16).padStart(8, "0");
 }
-function claudeWakeDirForProject(projectPath, homeDir = os4.homedir()) {
+function claudeWakeDirForProject(projectPath, homeDir = os4.homedir(), accountLabelScope = null) {
   const canonical = normalizeProjectPath(projectPath);
   const basename = path4.basename(canonical) || "project";
+  const legacyDir = `${basename}-${hashProjectKey(canonical)}`;
+  let canonicalScope;
+  try {
+    canonicalScope = serializeAccountLabelScope(
+      parseAccountLabelScope(accountLabelScope)
+    );
+  } catch (error) {
+    console.error(
+      `agents-comm-bus: invalid persisted Claude account_label_scope; using a scope-inert wake directory: ${error instanceof Error ? error.message : String(error)}`
+    );
+    canonicalScope = `__invalid__:${accountLabelScope}`;
+  }
   return path4.join(
     homeDir,
     ".agents-comm-bus",
     "claude-wake",
     "sessions",
-    `${basename}-${hashProjectKey(canonical)}`
+    canonicalScope ? `${legacyDir}-${crypto2.createHash("sha256").update(canonicalScope).digest("hex").slice(0, 12)}` : legacyDir
   );
 }
 async function writeClaudeWakeTrigger(wakeDir, now = Date.now) {
   await mkdir7(wakeDir, { recursive: true });
   await writeFile2(path4.join(wakeDir, "trigger-enter"), `${now()}
 `, "utf8");
+}
+var WAKE_SEED_MAX_CHARS = 2e3;
+function sanitizeWakeSeed(text) {
+  if (!text) return "";
+  const normalized = text.replace(/\r\n?/g, "\n").replace(/[\x00-\x09\x0B-\x1F\x7F]/g, "").trim();
+  return normalized.length > WAKE_SEED_MAX_CHARS ? normalized.slice(0, WAKE_SEED_MAX_CHARS) : normalized;
+}
+function buildWakeSeed(input) {
+  const body = (input.body ?? "").trim();
+  if (!body) return "";
+  const comm = input.comm && input.comm.length > 0 ? input.comm : "message";
+  const sender = input.sender && input.sender.length > 0 ? input.sender : "unknown sender";
+  return sanitizeWakeSeed(`${comm} message from ${sender}: ${body}`);
+}
+async function writeClaudeWakeSeed(wakeDir, text) {
+  await mkdir7(wakeDir, { recursive: true });
+  await writeFile2(path4.join(wakeDir, "wake-seed.txt"), text, "utf8");
 }
 async function writeClaudeWakeResponse(wakeDir, payload) {
   await mkdir7(wakeDir, { recursive: true });
@@ -7781,10 +8574,12 @@ async function writeClaudeWakeResponse(wakeDir, payload) {
   );
 }
 var ClaudeWakeRegistry = class {
-  constructor(now = Date.now) {
+  constructor(now = Date.now, sessionOwnerIsLive = createSessionOwnerLiveness()) {
     this.now = now;
+    this.sessionOwnerIsLive = sessionOwnerIsLive;
   }
   now;
+  sessionOwnerIsLive;
   registrations = /* @__PURE__ */ new Map();
   storage = null;
   /**
@@ -7804,22 +8599,48 @@ var ClaudeWakeRegistry = class {
     const registration = {
       session: input.session,
       project,
-      wakeDir: input.wakeDir ?? claudeWakeDirForProject(project),
-      registeredAt: this.now()
+      wakeDir: input.wakeDir ?? claudeWakeDirForProject(
+        project,
+        os4.homedir(),
+        input.account_label_scope ?? null
+      ),
+      registeredAt: this.now(),
+      account_label_scope: input.account_label_scope ?? null
     };
     this.registrations.set(input.session, registration);
     return registration;
   }
-  latestForProject(project) {
+  latestForProject(project, conversation) {
     const resolved = normalizeProjectPath(project);
-    let latest;
-    for (const registration of this.registrations.values()) {
-      if (registration.project !== resolved) continue;
-      if (!latest || registration.registeredAt > latest.registeredAt) {
-        latest = registration;
+    const candidates = [...this.registrations.values()].filter(
+      (registration) => registration.project === resolved
+    );
+    if (candidates.length === 0) return void 0;
+    if (!conversation) {
+      let latest;
+      for (const registration of candidates) {
+        if (!latest || registration.registeredAt > latest.registeredAt) {
+          latest = registration;
+        }
       }
+      return latest;
     }
-    return latest;
+    const match = resolveSessionForConversation(
+      candidates.map((registration) => ({
+        project: registration.project,
+        agent: "claude",
+        account_label_scope: registration.account_label_scope,
+        session_id: registration.session
+      })),
+      conversation,
+      (candidate) => candidate.session_id
+    );
+    if (match) {
+      return candidates.find((registration) => registration.session === match.session_id);
+    }
+    const unlabeled = candidates.filter((registration) => registration.account_label_scope == null);
+    if (unlabeled.length === 1) return unlabeled[0];
+    return void 0;
   }
   getForSession(session) {
     return this.registrations.get(session);
@@ -7831,29 +8652,55 @@ var ClaudeWakeRegistry = class {
     await writeClaudeWakeTrigger(registration.wakeDir, this.now);
     return true;
   }
-  async wakeConversation(conversation) {
+  async wakeConversation(conversation, message) {
     if (conversation.agent !== "claude") return false;
-    const registration = this.latestForProject(conversation.project) ?? await this.hydrateLatestForProject(conversation.project);
+    const registration = this.latestForProject(conversation.project, conversation) ?? await this.hydrateLatestForProject(conversation.project, conversation);
     if (!registration) return false;
+    const seed = buildWakeSeed({
+      comm: message?.chat.comm,
+      sender: message?.sender?.display_name ?? message?.sender?.id,
+      body: message?.text
+    });
+    if (seed) {
+      try {
+        await writeClaudeWakeSeed(registration.wakeDir, seed);
+      } catch {
+      }
+    }
     await writeClaudeWakeTrigger(registration.wakeDir, this.now);
     return true;
   }
   /**
    * On a miss in `wakeConversation`, look up the most recent Claude session
    * for this project from storage and seed the in-memory map. The wake_dir
-   * is deterministic from project, so reconstruction is lossless even
-   * across daemon restarts.
+   * is deterministic from persisted project + label scope, so reconstruction
+   * is lossless even across daemon restarts.
    */
-  async hydrateLatestForProject(project) {
+  async hydrateLatestForProject(project, conversation) {
     if (!this.storage) return void 0;
     const resolved = normalizeProjectPath(project);
     const sessions = await this.storage.listSessions({
       project: resolved,
-      agent: "claude"
+      agent: "claude",
+      status: "active"
     });
     if (sessions.length === 0) return void 0;
-    const latest = sessions[0];
-    return this.register({ session: latest.session_id, project: resolved });
+    const live = sessions.filter(this.sessionOwnerIsLive);
+    const pool = live.length > 0 ? live : sessions;
+    let match = conversation ? resolveSessionForConversation(pool, conversation, (sess) => sess.session_id) : pool[0];
+    if (conversation && !match) {
+      match = pool.find(
+        (session) => session.account_label_scope == null
+      );
+      if (!match) return void 0;
+    }
+    const latest = match;
+    if (!latest) return void 0;
+    return this.register({
+      session: latest.session_id,
+      project: resolved,
+      account_label_scope: latest.account_label_scope
+    });
   }
   /**
    * On a miss in `writeResponseForSession`, look up the specific session
@@ -7864,7 +8711,72 @@ var ClaudeWakeRegistry = class {
     if (!this.storage) return void 0;
     const record = await this.storage.getSession(session);
     if (!record || record.agent !== "claude") return void 0;
-    return this.register({ session, project: record.project });
+    return this.register({
+      session,
+      project: record.project,
+      account_label_scope: record.account_label_scope
+    });
+  }
+};
+
+// ../core-daemon/bridges/claude/open-query-tracker.ts
+var ClaudeOpenQueryTracker = class {
+  openQueriesBySession = /* @__PURE__ */ new Map();
+  querySessions = /* @__PURE__ */ new Map();
+  queryTtlTimers = /* @__PURE__ */ new Map();
+  setTimeoutFn;
+  clearTimeoutFn;
+  constructor(options = {}) {
+    this.setTimeoutFn = options.setTimeoutFn ?? ((fn, ms) => {
+      const handle = setTimeout(fn, ms);
+      handle.unref?.();
+      return handle;
+    });
+    this.clearTimeoutFn = options.clearTimeoutFn ?? ((h) => clearTimeout(h));
+  }
+  openQueryCount() {
+    let count = 0;
+    for (const set of this.openQueriesBySession.values()) count += set.size;
+    return count;
+  }
+  getRetirementBlockers() {
+    const count = this.openQueryCount();
+    return count > 0 ? { open_queries: count } : null;
+  }
+  trackOpenQuery(session, queryId, ttlSeconds) {
+    let set = this.openQueriesBySession.get(session);
+    if (!set) {
+      set = /* @__PURE__ */ new Set();
+      this.openQueriesBySession.set(session, set);
+    }
+    set.add(queryId);
+    this.querySessions.set(queryId, session);
+    const ttlMs = Math.max(1, Math.round(ttlSeconds * 1e3));
+    const timer = this.setTimeoutFn(() => {
+      this.clearOpenQuery(queryId);
+    }, ttlMs);
+    this.queryTtlTimers.set(queryId, timer);
+  }
+  clearOpenQuery(queryId) {
+    const timer = this.queryTtlTimers.get(queryId);
+    if (timer != null) {
+      this.clearTimeoutFn(timer);
+      this.queryTtlTimers.delete(queryId);
+    }
+    const session = this.querySessions.get(queryId);
+    this.querySessions.delete(queryId);
+    if (!session) return;
+    const set = this.openQueriesBySession.get(session);
+    if (!set) return;
+    set.delete(queryId);
+    if (set.size === 0) this.openQueriesBySession.delete(session);
+  }
+  clearOpenQueriesForSession(session) {
+    const set = this.openQueriesBySession.get(session);
+    if (!set) return;
+    for (const queryId of [...set]) {
+      this.clearOpenQuery(queryId);
+    }
   }
 };
 
@@ -7879,15 +8791,27 @@ var ClaudeBridge = class {
   constructor(options) {
     this.options = options;
     void options.pendingInboundMax;
+    this.sessionOwnerIsLive = options.sessionOwnerIsLive ?? createSessionOwnerLiveness();
+    this.wake = new ClaudeWakeRegistry(
+      Date.now,
+      this.sessionOwnerIsLive
+    );
     this.wake.setStorage(options.storage);
+    this.openQueryTracker = new ClaudeOpenQueryTracker({
+      setTimeoutFn: options.setTimeoutFn,
+      clearTimeoutFn: options.clearTimeoutFn
+    });
   }
   options;
   agentId = "claude";
   ipcMethods = CLAUDE_IPC_METHODS;
-  wake = new ClaudeWakeRegistry();
+  wake;
   ownedAccountsCache = null;
   /** AGE-37: sequential AskUserQuestion prompts keyed by the active query id. */
   questionSequences = /* @__PURE__ */ new Map();
+  /** AGE-36: daemon-local open-query tracking for retirement eligibility. */
+  openQueryTracker;
+  sessionOwnerIsLive;
   /**
    * Wire Claude-specific behaviors into the bus + per-comm callbacks. The
    * shared dispatch sink (pendingInbound + onInboundConversation fan-out)
@@ -7898,6 +8822,7 @@ var ClaudeBridge = class {
     this.options.bus.setResolveSink({
       onResolved: async (query, decision) => {
         if (query.agent !== this.agentId) return;
+        this.openQueryTracker.clearOpenQuery(query.query_id);
         const payload = wakePayloadFromDecision(decision);
         if (!payload) return;
         try {
@@ -7940,13 +8865,16 @@ var ClaudeBridge = class {
   }
   detachComm(_commId, _accountId) {
   }
+  getRetirementBlockers() {
+    return this.openQueryTracker.getRetirementBlockers();
+  }
   invalidateRegistrationCaches() {
     this.ownedAccountsCache = null;
   }
-  async onInboundConversation(conversation) {
+  async onInboundConversation(conversation, message) {
     if (conversation.agent !== this.agentId) return;
     try {
-      const delivered = await this.wake.wakeConversation(conversation);
+      const delivered = await this.wake.wakeConversation(conversation, message);
       if (!delivered) {
         await this.auditWakeFailure({
           reason: "hydration_miss",
@@ -8025,9 +8953,11 @@ var ClaudeBridge = class {
    * Future-proofing for runtime registration would re-fetch on miss; left
    * as a follow-up.
    */
-  async ensureCommsBestEffort(project) {
+  async ensureCommsBestEffort(project, accountLabelScope) {
     try {
-      await this.options.ensureCommsForSession?.(project, this.agentId);
+      await this.options.ensureCommsForSession?.(project, this.agentId, {
+        accountLabelScope: accountLabelScope ?? null
+      });
     } catch (error) {
       console.error(
         `agents-comm-bus: ensureCommsForSession failed for ${project}/${this.agentId}: ${error instanceof Error ? error.message : String(error)}`
@@ -8038,10 +8968,23 @@ var ClaudeBridge = class {
     if (session) {
       const sess = await this.options.storage.getSession(session);
       if (!sess) return /* @__PURE__ */ new Set();
-      const scoped = await this.options.storage.listAccountRegistrations({
-        project: sess.project,
-        agent: this.agentId
-      });
+      const [registrations2, sessions] = await Promise.all([
+        this.options.storage.listAccountRegistrations({
+          project: sess.project,
+          agent: this.agentId
+        }),
+        this.options.storage.listSessions({
+          project: sess.project,
+          agent: this.agentId,
+          status: "active"
+        })
+      ]);
+      const scoped = filterRegistrationsForSession(
+        registrations2,
+        sess,
+        sessions,
+        this.sessionOwnerIsLive
+      );
       return new Set(scoped.map((reg) => `${reg.comm}:${reg.bot_user_id}`));
     }
     if (this.ownedAccountsCache) return this.ownedAccountsCache;
@@ -8056,9 +8999,10 @@ var ClaudeBridge = class {
   async registerSession(params, socket) {
     const session = requiredString(params.session, "session");
     const project = normalizeProjectPath(requiredString(params.project, "project"));
-    const connectionId = typeof params.connection_id === "string" ? params.connection_id : `claude:${session}:${crypto2.randomUUID()}`;
+    const connectionId = typeof params.connection_id === "string" ? params.connection_id : `claude:${session}:${crypto3.randomUUID()}`;
     const now = Date.now();
     const wakeDir = typeof params.wake_dir === "string" ? params.wake_dir : typeof params.wakeDir === "string" ? params.wakeDir : void 0;
+    const accountLabelScope = accountLabelScopeFromParams(params);
     await this.options.storage.upsertSession({
       schema_version: SCHEMA_VERSION_SESSION,
       session_id: session,
@@ -8077,6 +9021,7 @@ var ClaudeBridge = class {
       lease_owner_daemon_bin: null,
       lease_owner_daemon_authority_rank: null,
       most_recent_inbound_conversation_id: null,
+      account_label_scope: accountLabelScope,
       status: "active"
     });
     const acquired = await this.options.storage.acquireSessionLease(
@@ -8086,10 +9031,15 @@ var ClaudeBridge = class {
       this.options.daemonOwner ? sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams(params), this.options.daemonOwner) : sessionLeaseOwnerFromParams(params)
     );
     if (!acquired) {
-      await this.ensureCommsBestEffort(project);
+      await this.ensureCommsBestEffort(project, accountLabelScope);
       return { ok: false, reason: "same-project claude session lease already held" };
     }
-    const registration = this.wake.register({ session, project, wakeDir });
+    const registration = this.wake.register({
+      session,
+      project,
+      wakeDir,
+      account_label_scope: accountLabelScope
+    });
     socket?.once("close", () => {
       void this.options.storage.releaseSessionConnectionLeasePreservingOwner(
         session,
@@ -8097,7 +9047,7 @@ var ClaudeBridge = class {
         Date.now()
       );
     });
-    await this.ensureCommsBestEffort(project);
+    await this.ensureCommsBestEffort(project, accountLabelScope);
     return { ok: true, wake_dir: registration.wakeDir };
   }
   async drainInbound(params) {
@@ -8184,7 +9134,7 @@ var ClaudeBridge = class {
    * setQuerySourceMessage. Used by the IPC handler and the AGE-37 sequencer.
    */
   async openQueryCore(input) {
-    const queryId = `q_${crypto2.randomUUID()}`;
+    const queryId = `q_${crypto3.randomUUID()}`;
     const query = {
       schema_version: 1,
       query_id: queryId,
@@ -8200,8 +9150,10 @@ var ClaudeBridge = class {
     if (input.supersede) {
       await this.options.storage.supersedeOpenQueriesForSession(input.session, Date.now());
       this.clearQuestionSequencesForSession(input.session);
+      this.openQueryTracker.clearOpenQueriesForSession(input.session);
     }
     await this.options.bus.openQuery(query);
+    this.openQueryTracker.trackOpenQuery(input.session, queryId, input.ttlSeconds);
     if (input.originChat) {
       try {
         const inlineKeyboard = inlineKeyboardForQuery(queryId, input.kind, input.options);
@@ -8231,6 +9183,7 @@ var ClaudeBridge = class {
             `agents-comm-bus: failed to cancel unsent query ${queryId}: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}`
           );
         }
+        this.openQueryTracker.clearOpenQuery(queryId);
         throw error;
       }
     }
@@ -8577,16 +9530,17 @@ var ClaudeBridgeFactory = class {
       audit: context.audit,
       pendingInbound: context.pendingInbound,
       ensureCommsForSession: context.ensureCommsForSession,
-      daemonOwner: context.daemonOwner
+      daemonOwner: context.daemonOwner,
+      sessionOwnerIsLive: context.sessionOwnerIsLive
     });
   }
 };
 
 // ../core-daemon/bridges/codex/bridge.ts
-import crypto4 from "node:crypto";
+import crypto5 from "node:crypto";
 
 // ../core-daemon/bridges/codex/adapter.ts
-import crypto3 from "node:crypto";
+import crypto4 from "node:crypto";
 
 // ../core-daemon/bridges/codex/app-server.ts
 var DEFAULT_CODEX_APP_SERVER_URL = "ws://127.0.0.1:4500";
@@ -8845,7 +9799,7 @@ var CodexAgentAdapter = class {
     this.defaultTtlSeconds = options.defaultTtlSeconds ?? 300;
     this.defaultAppServerUrl = options.defaultAppServerUrl ?? DEFAULT_CODEX_APP_SERVER_URL;
     this.wakePlaceholder = options.wakePlaceholder ?? ".";
-    this.queryIdFactory = options.queryIdFactory ?? (() => `codex:${crypto3.randomUUID()}`);
+    this.queryIdFactory = options.queryIdFactory ?? (() => `codex:${crypto4.randomUUID()}`);
     this.appServerClientFactory = options.appServerClientFactory ?? ((url) => new WebSocketCodexAppServerClient(url));
   }
   options;
@@ -9005,7 +9959,7 @@ function mapCodexHookPayloadToQuery(session, payload, options = {}) {
   const toolName = payload.tool_name ?? "PermissionRequest";
   const query = {
     schema_version: SCHEMA_VERSION_QUERY,
-    query_id: options.queryId ?? `codex:${crypto3.randomUUID()}`,
+    query_id: options.queryId ?? `codex:${crypto4.randomUUID()}`,
     agent,
     session,
     kind: "approval",
@@ -9070,7 +10024,7 @@ function recordOrEmpty2(value) {
 
 // ../core-daemon/bridges/codex/app-server-lifecycle.ts
 import { execFileSync } from "node:child_process";
-import { readFile as readFile5, writeFile as writeFile3 } from "node:fs/promises";
+import { readFile as readFile6, writeFile as writeFile3 } from "node:fs/promises";
 import os5 from "node:os";
 import path5 from "node:path";
 var DEFAULT_STOPPED_BY = "codex-bridge-lease-release";
@@ -9112,7 +10066,7 @@ function managedCodexAppServerStatePath(session, stateRoot2 = path5.join(os5.hom
 }
 async function readManagedAppServerState(statePath) {
   try {
-    return JSON.parse(await readFile5(statePath, "utf8"));
+    return JSON.parse(await readFile6(statePath, "utf8"));
   } catch {
     return null;
   }
@@ -9217,6 +10171,7 @@ var CODEX_IPC_METHODS = /* @__PURE__ */ new Set([
 var CodexBridge = class {
   constructor(options) {
     this.options = options;
+    this.sessionOwnerIsLive = options.sessionOwnerIsLive ?? createSessionOwnerLiveness();
     this.adapter = new CodexAgentAdapter({
       defaultAppServerUrl: options.defaultAppServerUrl ?? process.env.CODEX_APP_SERVER_URL,
       appServerClientFactory: options.appServerClientFactory
@@ -9227,10 +10182,14 @@ var CodexBridge = class {
   ipcMethods = CODEX_IPC_METHODS;
   adapter;
   waiters = /* @__PURE__ */ new Map();
-  sessionsByProject = /* @__PURE__ */ new Map();
+  sessionRoutes = /* @__PURE__ */ new Map();
   activeLeases = /* @__PURE__ */ new Map();
   ownedAccountsCache = null;
   ownerCheckTimer = null;
+  /** AGE-36: scheduled / in-flight managed app-server cleanup counters. */
+  pendingManagedCleanups = 0;
+  inFlightManagedCleanups = 0;
+  sessionOwnerIsLive;
   attach(comms) {
     this.options.bus.setResolveSink({
       onResolved: async (query, decision) => {
@@ -9254,17 +10213,31 @@ var CodexBridge = class {
   invalidateRegistrationCaches() {
     this.ownedAccountsCache = null;
   }
+  getRetirementBlockers() {
+    const blockers = {};
+    const managedLifecycle = [...this.activeLeases.values()].some(
+      (lease) => !lease.released && lease.manageAppServerLifecycle
+    );
+    if (this.waiters.size > 0) blockers.open_queries = this.waiters.size;
+    if (managedLifecycle) blockers.managed_lifecycle = 1;
+    if (this.pendingManagedCleanups > 0 || this.inFlightManagedCleanups > 0) {
+      blockers.pending_managed_cleanup = 1;
+    }
+    return Object.keys(blockers).length > 0 ? blockers : null;
+  }
   async onInboundConversation(conversation) {
     if (conversation.agent !== this.agentId) return;
-    const sessions = this.sessionsByProject.get(normalizeProjectPath(conversation.project));
-    const session = sessions?.values().next().value;
+    const session = await this.resolveSessionForConversation(conversation);
     if (!session) {
       await this.auditWake("agent_wake_skipped", conversation, void 0, {
         reason: "no_codex_session_for_project"
       });
       return;
     }
-    const pendingForSession = await this.pendingInboundForConversation(conversation);
+    const pendingForSession = await this.pendingInboundForConversation(
+      conversation,
+      session
+    );
     const mostRecentConversationId = pendingForSession.at(-1)?.conversation.conversation_id ?? conversation.conversation_id;
     await this.options.storage.setSessionMostRecentInbound(session, mostRecentConversationId);
     await this.auditWake("agent_wake_attempt", conversation, session, {
@@ -9289,7 +10262,7 @@ var CodexBridge = class {
           pending_count: pendingForSession.length,
           removed_pending_count: pendingForSession.length
         });
-        await this.removePendingInbound(pendingForSession);
+        await this.removePendingInbound(session, pendingForSession);
       }
     } catch (error) {
       await this.auditWake("agent_wake_failed", conversation, session, {
@@ -9320,19 +10293,45 @@ var CodexBridge = class {
   }
   async bootstrapStatus(params) {
     const project = normalizeProjectPath(requiredString2(params.project, "project"));
-    const registrations = await this.options.storage.listAccountRegistrations({
-      project,
-      agent: this.agentId
-    });
+    const accountLabelScope = accountLabelScopeFromParams(params);
+    const [registrations, sessions] = await Promise.all([
+      this.options.storage.listAccountRegistrations({
+        project,
+        agent: this.agentId
+      }),
+      this.options.storage.listSessions({
+        project,
+        agent: this.agentId,
+        status: "active"
+      })
+    ]);
+    const scopedRegistrations = filterRegistrationsForSession(
+      registrations,
+      {
+        // SessionStart runs before registration and may not have a managed
+        // session id yet. Use a non-persisted identity so every live session
+        // remains a sibling candidate for precedence.
+        session_id: "__codex_bootstrap_status__",
+        project,
+        agent: this.agentId,
+        account_label_scope: accountLabelScope,
+        status: "active",
+        lease_holder_connection_id: null,
+        lease_owner_process_pid: null,
+        lease_owner_process_registered_at: null
+      },
+      sessions,
+      this.sessionOwnerIsLive
+    );
     const hasAppServerUrl = typeof params.app_server_url === "string" && params.app_server_url.trim().length > 0;
     const hasManagedSession = typeof params.managed_session_id === "string" && params.managed_session_id.trim().length > 0;
     const managedAppServerPresent = hasAppServerUrl && hasManagedSession && params.app_server_reachable === true;
-    const hasAccountRegistration = registrations.length > 0;
+    const hasAccountRegistration = scopedRegistrations.length > 0;
     const bootstrapRequired = hasAccountRegistration && !managedAppServerPresent;
     return {
       ok: true,
       has_account_registration: hasAccountRegistration,
-      registration_count: registrations.length,
+      registration_count: scopedRegistrations.length,
       managed_app_server_present: managedAppServerPresent,
       bootstrap_required: bootstrapRequired,
       reason: !hasAccountRegistration ? "no codex comm account registration for project" : managedAppServerPresent ? "codex session already has a reachable managed app-server url" : "codex comm account registration exists but no managed app-server url is present"
@@ -9341,8 +10340,9 @@ var CodexBridge = class {
   async registerSession(params, socket) {
     const session = requiredString2(params.session, "session");
     const project = normalizeProjectPath(requiredString2(params.project, "project"));
-    const connectionId = typeof params.connection_id === "string" ? params.connection_id : `codex:${session}:${crypto4.randomUUID()}`;
+    const connectionId = typeof params.connection_id === "string" ? params.connection_id : `codex:${session}:${crypto5.randomUUID()}`;
     const now = Date.now();
+    const accountLabelScope = accountLabelScopeFromParams(params);
     await this.options.storage.upsertSession({
       schema_version: SCHEMA_VERSION_SESSION,
       session_id: session,
@@ -9361,6 +10361,7 @@ var CodexBridge = class {
       lease_owner_daemon_bin: null,
       lease_owner_daemon_authority_rank: null,
       most_recent_inbound_conversation_id: null,
+      account_label_scope: accountLabelScope,
       status: "active"
     });
     const replaceExistingLease = params.replace_existing_lease === true || params.persist_after_disconnect === true;
@@ -9397,18 +10398,18 @@ var CodexBridge = class {
           leaseOwner
         );
         if (!reacquired) {
-          await this.ensureCommsBestEffort(project);
+          await this.ensureCommsBestEffort(project, accountLabelScope);
           return { ok: false, reason: "same-project codex session lease already held" };
         }
       } else if (existing?.lease_holder_connection_id) {
-        await this.ensureCommsBestEffort(project);
+        await this.ensureCommsBestEffort(project, accountLabelScope);
         return {
           ok: true,
           reason: "codex session lease already held; registration refreshed",
           capabilities: this.adapter.capabilities
         };
       } else {
-        await this.ensureCommsBestEffort(project);
+        await this.ensureCommsBestEffort(project, accountLabelScope);
         return { ok: false, reason: "same-project codex session lease already held" };
       }
     }
@@ -9417,8 +10418,8 @@ var CodexBridge = class {
     if (typeof params.app_server_url === "string") {
       this.adapter.setAppServerUrl(session, params.app_server_url);
     }
-    this.trackSession(project, session);
-    await this.ensureCommsBestEffort(project);
+    this.trackSession(project, session, accountLabelScope);
+    await this.ensureCommsBestEffort(project, accountLabelScope);
     const persistAfterDisconnect = params.persist_after_disconnect === true;
     const manageAppServerLifecycle = params.manage_app_server_lifecycle === true || params.source === "mcp-server";
     const lease = {
@@ -9466,20 +10467,20 @@ var CodexBridge = class {
       params.prompt_text ?? queryInput.prompt_text,
       "prompt_text"
     );
-    const queryId = `q_${crypto4.randomUUID()}`;
+    const queryId = `q_${crypto5.randomUUID()}`;
     const sessionRecord = await this.options.storage.getSession(session);
     const conversation = sessionRecord?.most_recent_inbound_conversation_id ? await this.options.storage.getConversation(sessionRecord.most_recent_inbound_conversation_id) : null;
     const originChat = conversation ? await this.chatRefForConversation(conversation) : void 0;
     if (!originChat) {
-      const hookResponse2 = codexHookDecision(
+      const hookResponse = codexHookDecision(
         "deny",
         `No recent inbound comm conversation is associated with Codex session ${session}.`
       );
       return {
         query_id: queryId,
-        hook_response: hookResponse2,
-        hookJson: hookResponse2,
-        nativeHookJson: hookResponse2
+        hook_response: hookResponse,
+        hookJson: hookResponse,
+        nativeHookJson: hookResponse
       };
     }
     const query = {
@@ -9498,34 +10499,39 @@ var CodexBridge = class {
       await this.options.storage.supersedeOpenQueriesForSession(session, Date.now());
     }
     const resolutionPromise = this.waitForResolution(queryId, query.ttl_seconds);
-    await this.options.bus.openQuery(query);
-    const promptFormat = params.prompt_format ?? queryInput.prompt_format;
-    const promptMessageId = await this.options.bus.send({
-      session,
-      comm: originChat.comm,
-      target: originChat,
-      payload: {
-        text: promptText,
-        format: promptFormat === "html" ? "html" : "plain",
-        inline_keyboard: inlineKeyboardForQuery2(queryId)
-      },
-      idempotencyKey: `query:${queryId}`
-    });
     try {
-      await this.options.storage.setQuerySourceMessage(queryId, promptMessageId);
+      await this.options.bus.openQuery(query);
+      const promptFormat = params.prompt_format ?? queryInput.prompt_format;
+      const promptMessageId = await this.options.bus.send({
+        session,
+        comm: originChat.comm,
+        target: originChat,
+        payload: {
+          text: promptText,
+          format: promptFormat === "html" ? "html" : "plain",
+          inline_keyboard: inlineKeyboardForQuery2(queryId)
+        },
+        idempotencyKey: `query:${queryId}`
+      });
+      try {
+        await this.options.storage.setQuerySourceMessage(queryId, promptMessageId);
+      } catch (error) {
+        console.error(
+          `agents-comm-bus: failed to record prompt message id for ${queryId}: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      const decision = await resolutionPromise;
+      const hookResponse = codexDecisionFromResolution(decision);
+      return {
+        query_id: queryId,
+        hook_response: hookResponse,
+        hookJson: hookResponse,
+        nativeHookJson: hookResponse
+      };
     } catch (error) {
-      console.error(
-        `agents-comm-bus: failed to record prompt message id for ${queryId}: ${error instanceof Error ? error.message : String(error)}`
-      );
+      this.clearWaiter(queryId);
+      throw error;
     }
-    const decision = await resolutionPromise;
-    const hookResponse = codexDecisionFromResolution(decision);
-    return {
-      query_id: queryId,
-      hook_response: hookResponse,
-      hookJson: hookResponse,
-      nativeHookJson: hookResponse
-    };
   }
   async turnControl(params) {
     const session = requiredString2(params.session, "session");
@@ -9594,35 +10600,67 @@ var CodexBridge = class {
     );
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
-        this.waiters.delete(queryId);
+        this.clearWaiter(queryId);
         resolve(null);
       }, timeoutMs);
+      timer.unref?.();
       this.waiters.set(queryId, (decision) => {
         clearTimeout(timer);
-        this.waiters.delete(queryId);
+        this.clearWaiter(queryId);
         resolve(decision);
       });
     });
   }
-  async ensureCommsBestEffort(project) {
+  clearWaiter(queryId) {
+    this.waiters.delete(queryId);
+  }
+  async ensureCommsBestEffort(project, accountLabelScope) {
     try {
-      await this.options.ensureCommsForSession?.(project, this.agentId);
+      await this.options.ensureCommsForSession?.(project, this.agentId, {
+        accountLabelScope: accountLabelScope ?? null
+      });
     } catch (error) {
       console.error(
         `agents-comm-bus: ensureCommsForSession failed for ${project}/${this.agentId}: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
-  trackSession(project, session) {
-    const sessions = this.sessionsByProject.get(project) ?? /* @__PURE__ */ new Set();
-    sessions.add(session);
-    this.sessionsByProject.set(project, sessions);
+  trackSession(project, session, accountLabelScope) {
+    this.sessionRoutes.set(session, {
+      project,
+      account_label_scope: accountLabelScope
+    });
   }
   untrackSession(project, session) {
-    const sessions = this.sessionsByProject.get(project);
-    if (!sessions) return;
-    sessions.delete(session);
-    if (sessions.size === 0) this.sessionsByProject.delete(project);
+    const route = this.sessionRoutes.get(session);
+    if (!route || route.project !== project) return;
+    this.sessionRoutes.delete(session);
+  }
+  async resolveSessionForConversation(conversation) {
+    const project = normalizeProjectPath(conversation.project);
+    const inMemory = [...this.sessionRoutes.entries()].filter(([, route]) => route.project === project).map(([sessionId, route]) => ({
+      session_id: sessionId,
+      project: route.project,
+      agent: this.agentId,
+      account_label_scope: route.account_label_scope
+    }));
+    const fromMemory = resolveSessionForConversation(
+      inMemory,
+      conversation,
+      (sess) => sess.session_id
+    );
+    if (fromMemory) return fromMemory.session_id;
+    const sessions = await this.options.storage.listSessions({
+      project,
+      agent: this.agentId,
+      status: "active"
+    });
+    const live = sessions.filter((sess) => sess.lease_holder_connection_id != null);
+    const pool = live.length > 0 ? live : sessions;
+    const hydrated = resolveSessionForConversation(pool, conversation, (sess) => sess.session_id);
+    if (!hydrated) return void 0;
+    this.trackSession(project, hydrated.session_id, hydrated.account_label_scope);
+    return hydrated.session_id;
   }
   async releaseSessionLease(input) {
     if (input.released) return;
@@ -9634,7 +10672,15 @@ var CodexBridge = class {
         this.activeLeases.delete(input.session);
       }
       await this.adapter.disconnect(input.session);
-      await this.options.storage.releaseSessionLease(input.session, input.connectionId, Date.now());
+      if (input.manageAppServerLifecycle) {
+        await this.options.storage.releaseSessionConnectionLeasePreservingOwner(
+          input.session,
+          input.connectionId,
+          Date.now()
+        );
+      } else {
+        await this.options.storage.releaseSessionLease(input.session, input.connectionId, Date.now());
+      }
       input.control.close();
       if (input.manageAppServerLifecycle) {
         this.scheduleManagedAppServerCleanup(input.session);
@@ -9689,16 +10735,35 @@ var CodexBridge = class {
   }
   scheduleManagedAppServerCleanup(session) {
     const delay = this.options.appServerCleanupDelayMs ?? DEFAULT_APP_SERVER_CLEANUP_DELAY_MS;
-    const timer = setTimeout(() => {
-      void this.cleanupManagedAppServerIfLeaseIsIdle(session);
+    this.pendingManagedCleanups += 1;
+    const setTimeoutFn = this.options.setTimeoutFn ?? ((fn, ms) => {
+      const handle = setTimeout(fn, ms);
+      handle.unref?.();
+      return handle;
+    });
+    setTimeoutFn(() => {
+      this.pendingManagedCleanups -= 1;
+      this.inFlightManagedCleanups += 1;
+      void this.cleanupManagedAppServerIfLeaseIsIdle(session).finally(() => {
+        this.inFlightManagedCleanups -= 1;
+      });
     }, delay);
-    timer.unref?.();
   }
   async cleanupManagedAppServerIfLeaseIsIdle(session) {
     try {
       const record = await this.options.storage.getSession(session);
       if (record?.lease_holder_connection_id) return;
-      await cleanupManagedCodexAppServer(session);
+      const result = await cleanupManagedCodexAppServer(session);
+      if (!result.ok) return;
+      const latest = await this.options.storage.getSession(session);
+      if (!latest || latest.status !== "active" || latest.lease_holder_connection_id) {
+        return;
+      }
+      await this.options.storage.endSessionIfUnchanged(
+        session,
+        sessionEndObservation(latest),
+        Date.now()
+      );
     } catch (error) {
       console.error(
         `agents-comm-bus: failed to cleanup Codex app-server for ${session}: ${error instanceof Error ? error.message : String(error)}`
@@ -9753,8 +10818,8 @@ var CodexBridge = class {
       );
     }
   }
-  async pendingInboundForConversation(conversation) {
-    const owned = await this.ownedAccountKeys();
+  async pendingInboundForConversation(conversation, session) {
+    const owned = await this.ownedAccountKeys(session);
     return this.options.pendingInbound.filter(
       (entry) => owned.has(accountKey2(entry)) && entry.conversation.project === conversation.project
     );
@@ -9767,10 +10832,23 @@ var CodexBridge = class {
     if (session) {
       const sess = await this.options.storage.getSession(session);
       if (!sess) return /* @__PURE__ */ new Set();
-      const scoped = await this.options.storage.listAccountRegistrations({
-        project: sess.project,
-        agent: this.agentId
-      });
+      const [registrations2, sessions] = await Promise.all([
+        this.options.storage.listAccountRegistrations({
+          project: sess.project,
+          agent: this.agentId
+        }),
+        this.options.storage.listSessions({
+          project: sess.project,
+          agent: this.agentId,
+          status: "active"
+        })
+      ]);
+      const scoped = filterRegistrationsForSession(
+        registrations2,
+        sess,
+        sessions,
+        this.sessionOwnerIsLive
+      );
       return new Set(scoped.map((reg) => `${reg.comm}:${reg.bot_user_id}`));
     }
     if (this.ownedAccountsCache) return this.ownedAccountsCache;
@@ -9782,9 +10860,9 @@ var CodexBridge = class {
     );
     return this.ownedAccountsCache;
   }
-  async removePendingInbound(entries) {
+  async removePendingInbound(session, entries) {
     if (entries.length === 0) return;
-    const owned = await this.ownedAccountKeys();
+    const owned = await this.ownedAccountKeys(session);
     const scoped = entries.filter((entry) => owned.has(accountKey2(entry)));
     await removePendingInboundEntries(
       this.options.storage,
@@ -9945,7 +11023,8 @@ var CodexBridgeFactory = class {
       audit: context.audit,
       pendingInbound: context.pendingInbound,
       ensureCommsForSession: context.ensureCommsForSession,
-      daemonOwner: context.daemonOwner
+      daemonOwner: context.daemonOwner,
+      sessionOwnerIsLive: context.sessionOwnerIsLive
     });
   }
 };
@@ -9959,10 +11038,12 @@ var PI_IPC_METHODS = /* @__PURE__ */ new Set([
 var PiBridge = class {
   constructor(options) {
     this.options = options;
+    this.sessionOwnerIsLive = options.sessionOwnerIsLive ?? createSessionOwnerLiveness();
   }
   options;
   agentId = "pi";
   ipcMethods = PI_IPC_METHODS;
+  sessionOwnerIsLive;
   attach(_comms) {
   }
   async handleIpcMethod(method, params, ctx) {
@@ -9977,9 +11058,11 @@ var PiBridge = class {
         throw new Error(`PiBridge does not handle IPC method: ${method}`);
     }
   }
-  async ensureCommsBestEffort(project) {
+  async ensureCommsBestEffort(project, accountLabelScope) {
     try {
-      await this.options.ensureCommsForSession?.(project, this.agentId);
+      await this.options.ensureCommsForSession?.(project, this.agentId, {
+        accountLabelScope: accountLabelScope ?? null
+      });
     } catch (error) {
       console.error(
         `agents-comm-bus: ensureCommsForSession failed for ${project}/${this.agentId}: ${error instanceof Error ? error.message : String(error)}`
@@ -9990,10 +11073,23 @@ var PiBridge = class {
     if (session) {
       const sess = await this.options.storage.getSession(session);
       if (!sess) return /* @__PURE__ */ new Set();
-      const scoped = await this.options.storage.listAccountRegistrations({
-        project: sess.project,
-        agent: this.agentId
-      });
+      const [registrations2, sessions] = await Promise.all([
+        this.options.storage.listAccountRegistrations({
+          project: sess.project,
+          agent: this.agentId
+        }),
+        this.options.storage.listSessions({
+          project: sess.project,
+          agent: this.agentId,
+          status: "active"
+        })
+      ]);
+      const scoped = filterRegistrationsForSession(
+        registrations2,
+        sess,
+        sessions,
+        this.sessionOwnerIsLive
+      );
       return new Set(scoped.map((reg) => `${reg.comm}:${reg.bot_user_id}`));
     }
     const registrations = await this.options.storage.listAccountRegistrations({
@@ -10015,6 +11111,7 @@ var PiBridge = class {
     const project = normalizeProjectPath(requiredString3(params.project, "project"));
     const connectionId = requiredString3(params.connection_id, "connection_id");
     const now = Date.now();
+    const accountLabelScope = accountLabelScopeFromParams(params);
     await this.options.storage.upsertSession({
       schema_version: SCHEMA_VERSION_SESSION,
       session_id: session,
@@ -10033,6 +11130,7 @@ var PiBridge = class {
       lease_owner_daemon_bin: null,
       lease_owner_daemon_authority_rank: null,
       most_recent_inbound_conversation_id: null,
+      account_label_scope: accountLabelScope,
       status: "active"
     });
     const leaseOwner = this.options.daemonOwner ? sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams3(params), this.options.daemonOwner) : sessionLeaseOwnerFromParams3(params);
@@ -10043,7 +11141,7 @@ var PiBridge = class {
       leaseOwner
     );
     if (!acquired) {
-      await this.ensureCommsBestEffort(project);
+      await this.ensureCommsBestEffort(project, accountLabelScope);
       return { ok: false, reason: "pi session lease already held" };
     }
     socket?.once("close", () => {
@@ -10053,7 +11151,7 @@ var PiBridge = class {
         Date.now()
       );
     });
-    await this.ensureCommsBestEffort(project);
+    await this.ensureCommsBestEffort(project, accountLabelScope);
     return { ok: true, session, project, agent: "pi" };
   }
   async drainInbound(params) {
@@ -10090,7 +11188,14 @@ var PiBridge = class {
     const sess = await this.options.storage.getSession(session);
     if (!sess) return { ok: true };
     this.assertCallerProjectMatchesStored(session, sess.project, params);
-    await this.options.storage.releaseSessionLease(session, connectionId, Date.now());
+    if (sess.lease_holder_connection_id != null && sess.lease_holder_connection_id !== connectionId) {
+      return { ok: true };
+    }
+    await this.options.storage.endSessionIfUnchanged(
+      session,
+      sessionEndObservation(sess),
+      Date.now()
+    );
     return { ok: true };
   }
 };
@@ -10128,7 +11233,8 @@ var PiBridgeFactory = class {
       audit: context.audit,
       pendingInbound: context.pendingInbound,
       ensureCommsForSession: context.ensureCommsForSession,
-      daemonOwner: context.daemonOwner
+      daemonOwner: context.daemonOwner,
+      sessionOwnerIsLive: context.sessionOwnerIsLive
     });
   }
 };

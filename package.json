@@ -1,27 +1,35 @@
 {
   "name": "@agents-comm-bus/pi-discord",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "description": "Pi host extension for agents-comm-bus — discord comm (bundles the shared pi-core).",
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "pi": {
     "extensions": [
       "node_modules/@agents-comm-bus/pi-core/extensions",
       "./extensions/discord"
     ],
-    "skills": ["./skills"]
+    "skills": [
+      "./skills"
+    ]
   },
   "dependencies": {
-    "@agents-comm-bus/pi-core": "git+https://github.com/remingtonspaz/agents-comm-bus-pi-core.git"
+    "@agents-comm-bus/pi-core": "git+https://github.com/remingtonspaz/agents-comm-bus-pi-core.git#cf7dce1331d265d549e8dc1348e60a2d9dffe869"
   },
-  "bundledDependencies": ["@agents-comm-bus/pi-core"],
+  "bundledDependencies": [
+    "@agents-comm-bus/pi-core"
+  ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "postinstall": "node ./scripts/postinstall.mjs"
   },
