@@ -3174,7 +3174,7 @@ var require_stream = __commonJS({
       };
       duplex._final = function(callback) {
         if (ws.readyState === ws.CONNECTING) {
-          ws.once("open", function open3() {
+          ws.once("open", function open4() {
             duplex._final(callback);
           });
           return;
@@ -3195,7 +3195,7 @@ var require_stream = __commonJS({
       };
       duplex._write = function(chunk, encoding, callback) {
         if (ws.readyState === ws.CONNECTING) {
-          ws.once("open", function open3() {
+          ws.once("open", function open4() {
             duplex._write(chunk, encoding, callback);
           });
           return;
@@ -3650,7 +3650,7 @@ var require_websocket_server = __commonJS({
 
 // ../core-daemon/cli/account-add.ts
 import { randomBytes } from "node:crypto";
-import { mkdir as mkdir7 } from "node:fs/promises";
+import { mkdir as mkdir9 } from "node:fs/promises";
 
 // ../packages/core-contracts/dist/types.js
 var SCHEMA_VERSION_ACCOUNT = 1;
@@ -3681,10 +3681,10 @@ import { createHash } from "node:crypto";
 
 // ../core-daemon/config.ts
 var DAEMON_NAME = "agents-comm-bus";
-var DAEMON_VERSION = "0.2.41";
-var IPC_PROTOCOL_VERSION = "1.2.0";
+var DAEMON_VERSION = "0.2.69";
+var IPC_PROTOCOL_VERSION = "1.3.0";
 var IPC_HOST = "127.0.0.1";
-var DEFAULT_BOOTSTRAP_TIMEOUT_MS = 5e3;
+var DEFAULT_BOOTSTRAP_TIMEOUT_MS = 2e4;
 var DEFAULT_BOOTSTRAP_RETRY_MS = 50;
 var DEFAULT_SPAWN_LOCK_STALE_GRACE_MS = 2e3;
 function protocolMajor(version) {
@@ -3717,6 +3717,9 @@ function resolveStatePaths(options = {}) {
 function discoveryRoot(options = {}) {
   return path2.resolve(options.discoveryRoot ?? stateRoot(options));
 }
+function normalizeDaemonRootPath(root) {
+  return normalizeProjectPath(root);
+}
 function resolveDiscoveryPaths(options = {}) {
   const root = discoveryRoot(options);
   return {
@@ -3745,6 +3748,194 @@ function safePathSegment(value) {
 
 // ../core-daemon/storage/sqlite.ts
 import { createRequire } from "node:module";
+
+// ../core-daemon/runtime/herdr.ts
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+var execFileAsync = promisify(execFile);
+function parseHerdrIdentity(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw;
+  if (record.type !== "herdr") return null;
+  const agent = record.agent;
+  const pane_id = record.pane_id;
+  const socket_path = record.socket_path;
+  if (typeof agent !== "string" || agent.trim() === "") return null;
+  if (typeof pane_id !== "string" || pane_id.trim() === "") return null;
+  if (typeof socket_path !== "string" || socket_path.trim() === "") return null;
+  const identity = {
+    type: "herdr",
+    agent,
+    pane_id,
+    socket_path
+  };
+  if (typeof record.workspace_id === "string" && record.workspace_id.length > 0) {
+    identity.workspace_id = record.workspace_id;
+  }
+  if (typeof record.tab_id === "string" && record.tab_id.length > 0) {
+    identity.tab_id = record.tab_id;
+  }
+  if (typeof record.bin_path === "string" && record.bin_path.length > 0) {
+    identity.bin_path = record.bin_path;
+  }
+  return identity;
+}
+function parseHerdrIdentityJson(json) {
+  if (!json) return null;
+  try {
+    return parseHerdrIdentity(JSON.parse(json));
+  } catch {
+    return null;
+  }
+}
+
+// ../core-daemon/runtime/process-start-epoch.ts
+import { execFile as execFile2 } from "node:child_process";
+import { readFileSync } from "node:fs";
+function createProcessStartIdentityCache(probe, now = Date.now, ttlMs = 1e3, selfPid = process.pid) {
+  const values = /* @__PURE__ */ new Map();
+  const pending = /* @__PURE__ */ new Map();
+  let generation = 0;
+  const prefetch = async (pids, refresh = false) => {
+    const ids = [...new Set(pids)].filter((pid) => Number.isInteger(pid) && pid > 0);
+    const pinned = (pid) => pid === selfPid && values.get(pid)?.value != null;
+    const missing = ids.filter((pid) => !pending.has(pid) && !pinned(pid) && (refresh || !values.has(pid) || now() - values.get(pid).at >= ttlMs));
+    if (missing.length) {
+      const epoch = generation;
+      const work = Promise.resolve().then(() => probe(missing)).catch(() => /* @__PURE__ */ new Map()).then((results) => {
+        if (epoch !== generation) return;
+        for (const pid of missing) values.set(pid, { value: results.get(pid) ?? null, at: now() });
+        for (const pid of values.keys()) {
+          if (values.size <= 4096) break;
+          if (pid !== selfPid) values.delete(pid);
+        }
+      }).finally(() => {
+        if (epoch === generation) for (const pid of missing) pending.delete(pid);
+      });
+      for (const pid of missing) pending.set(pid, work);
+    }
+    await Promise.all(ids.map((pid) => pending.get(pid)));
+  };
+  return {
+    read(pid) {
+      if (pending.has(pid)) return null;
+      const entry = values.get(pid);
+      if (entry && (pid === selfPid && entry.value != null || now() - entry.at < ttlMs)) return entry.value;
+      void prefetch([pid]);
+      return null;
+    },
+    prefetch,
+    reset() {
+      generation += 1;
+      values.clear();
+      pending.clear();
+    }
+  };
+}
+function execText(file, args) {
+  return new Promise((resolve3, reject) => {
+    execFile2(
+      file,
+      args,
+      { encoding: "utf8", windowsHide: true, timeout: 2e3, maxBuffer: 1024 * 1024 },
+      (error, stdout) => error ? reject(error) : resolve3(stdout)
+    );
+  });
+}
+async function probeProcessIdentities(pids, platform = process.platform, run = execText) {
+  const result = /* @__PURE__ */ new Map();
+  pids = [...new Set(pids)].filter((pid) => Number.isInteger(pid) && pid > 0);
+  if (!pids.length) return result;
+  if (platform === "win32") {
+    const out = await run("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `Get-Process -Id ${pids.join(",")} -ErrorAction SilentlyContinue | ForEach-Object { try { '{0}:{1}' -f $_.Id,$_.StartTime.ToUniversalTime().Ticks } catch {} }`
+    ]);
+    for (const line of out.trim().split(/\r?\n/)) {
+      const match = /^(\d+):(\d+)$/.exec(line.trim());
+      if (match) result.set(Number(match[1]), Number(BigInt(match[2]) / 10000n - 62135596800000n));
+    }
+  } else if (platform === "darwin") {
+    const out = await run("ps", ["-o", "pid=,lstart=", "-p", pids.join(",")]);
+    for (const line of out.trim().split(/\r?\n/)) {
+      const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+      if (match && Number.isFinite(Date.parse(match[2]))) result.set(Number(match[1]), Date.parse(match[2]));
+    }
+  }
+  return result;
+}
+var identityCache = createProcessStartIdentityCache(probeProcessIdentities);
+async function prefetchProcessStartIdentity(pids) {
+  if (process.platform === "win32" || process.platform === "darwin") {
+    await identityCache.prefetch(pids, true);
+  }
+}
+function readProcessStartIdentity(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    if (options.readProcStat && options.readBootId) {
+      return readLinuxProcessStartIdentity(pid, options);
+    }
+    if (process.platform === "linux") {
+      return readLinuxProcessStartIdentity(pid, options);
+    }
+    if (process.platform === "darwin" || process.platform === "win32") {
+      return identityCache.read(pid);
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+function readProcessStartEpochMs(pid, options = {}) {
+  return readProcessStartIdentity(pid, options);
+}
+function fnv1a32(input) {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+function readLinuxBootId(options) {
+  if (options.readBootId) return options.readBootId();
+  try {
+    return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+function readLinuxStartTicks(pid, readProcStat) {
+  const raw = readProcStat?.(pid) ?? (() => {
+    try {
+      return readFileSync(`/proc/${pid}/stat`, "utf8");
+    } catch {
+      return null;
+    }
+  })();
+  if (!raw) return null;
+  const closeParen = raw.lastIndexOf(")");
+  if (closeParen < 0) return null;
+  const fields = raw.slice(closeParen + 2).split(" ");
+  const startTicks = Number(fields[19]);
+  return Number.isFinite(startTicks) ? startTicks : null;
+}
+function readLinuxProcessStartIdentity(pid, options) {
+  const bootId = readLinuxBootId(options);
+  const startTicks = readLinuxStartTicks(pid, options.readProcStat);
+  if (!bootId || startTicks == null) return null;
+  return fnv1a32(`${bootId}:${startTicks}`);
+}
+var currentProcessStart;
+function currentProcessStartEpochMs() {
+  if (currentProcessStart !== void 0) return currentProcessStart;
+  const fromOs = readProcessStartIdentity(process.pid);
+  currentProcessStart = fromOs ?? Date.now() - Math.round(process.uptime() * 1e3);
+  return currentProcessStart;
+}
 
 // ../core-daemon/storage/schema/runner.ts
 import { readFile } from "node:fs/promises";
@@ -3868,6 +4059,41 @@ var sessionLabelScopeMigration = {
     await ctx.exec(sql);
   }
 };
+var curlInboundIdempotencyMigration = {
+  version: 13,
+  description: "AGE-96: curl inbound idempotency receipts + acceptance progress",
+  async up(ctx) {
+    const sql = await readFile(join(schemaDir, "013_curl_inbound_idempotency.sql"), "utf8");
+    await ctx.exec(sql);
+  }
+};
+var registrationActivationMigration = {
+  version: 14,
+  description: "AGE-97: account_registrations activation flag (lazy | eager)",
+  async up(ctx) {
+    const sql = await readFile(join(schemaDir, "014_registration_activation.sql"), "utf8");
+    await ctx.exec(sql);
+  }
+};
+var sessionOwnerProcessStartTimeMigration = {
+  version: 15,
+  description: "AGE-101: process start epoch for pid+start-time owner liveness",
+  async up(ctx) {
+    const sql = await readFile(
+      join(schemaDir, "015_session_owner_process_start_time.sql"),
+      "utf8"
+    );
+    await ctx.exec(sql);
+  }
+};
+var herdrWakeMigration = {
+  version: 16,
+  description: "AGE-110: herdr wake identity + wake mode preferences",
+  async up(ctx) {
+    const sql = await readFile(join(schemaDir, "016_herdr_wake.sql"), "utf8");
+    await ctx.exec(sql);
+  }
+};
 async function runStorageMigrations(db) {
   await new SqliteMigrationRunner(db).apply([
     initialMigration,
@@ -3881,7 +4107,11 @@ async function runStorageMigrations(db) {
     multiOpenQueriesMigration,
     durablePendingInboundMigration,
     sessionDaemonOwnerMigration,
-    sessionLabelScopeMigration
+    sessionLabelScopeMigration,
+    curlInboundIdempotencyMigration,
+    registrationActivationMigration,
+    sessionOwnerProcessStartTimeMigration,
+    herdrWakeMigration
   ]);
 }
 
@@ -3905,8 +4135,8 @@ var SqliteStorage = class _SqliteStorage {
     this.db = db;
   }
   db;
-  static async open(path13) {
-    const db = new DatabaseSync(path13);
+  static async open(path15) {
+    const db = new DatabaseSync(path15);
     db.exec("PRAGMA foreign_keys = ON");
     db.exec("PRAGMA busy_timeout = 5000");
     await runStorageMigrations(db);
@@ -3917,8 +4147,8 @@ var SqliteStorage = class _SqliteStorage {
     this.db.prepare(`
         INSERT INTO account_registrations (
           schema_version, registration_id, project, comm, agent, account_label,
-          bot_user_id, credentials_ref, bot_username, created_at, updated_at, metadata_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          bot_user_id, credentials_ref, activation, bot_username, created_at, updated_at, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(project, comm, agent, account_label) DO UPDATE SET
           bot_user_id = excluded.bot_user_id,
           credentials_ref = excluded.credentials_ref,
@@ -3934,6 +4164,7 @@ var SqliteStorage = class _SqliteStorage {
       rec.account_label,
       rec.bot_user_id,
       rec.credentials_ref,
+      rec.activation ?? "lazy",
       rec.bot_username ?? null,
       rec.created_at,
       rec.updated_at,
@@ -3942,6 +4173,10 @@ var SqliteStorage = class _SqliteStorage {
   }
   async getAccountByBot(comm, bot_user_id) {
     const row = this.db.prepare("SELECT * FROM account_registrations WHERE comm = ? AND bot_user_id = ?").get(comm, bot_user_id);
+    return row ? this.accountFromRow(row) : null;
+  }
+  async getAccountByRegistrationId(registration_id) {
+    const row = this.db.prepare("SELECT * FROM account_registrations WHERE registration_id = ?").get(registration_id);
     return row ? this.accountFromRow(row) : null;
   }
   async listAccountRegistrations(filter = {}) {
@@ -4090,6 +4325,42 @@ var SqliteStorage = class _SqliteStorage {
       if (Number(result.changes ?? 0) !== 1) {
         throw new Error(
           `failed to relabel account registration for ${input.comm}/${input.bot_user_id}`
+        );
+      }
+      const nextRow = this.db.prepare("SELECT * FROM account_registrations WHERE registration_id = ?").get(previous.registration_id);
+      if (!nextRow) {
+        throw new Error(`updated account registration not found for ${previous.registration_id}`);
+      }
+      this.db.exec("COMMIT");
+      return { previous, next: this.accountFromRow(nextRow) };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  async updateAccountRegistrationActivation(input) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const previousRow = this.db.prepare("SELECT * FROM account_registrations WHERE comm = ? AND bot_user_id = ?").get(input.comm, input.bot_user_id);
+      if (!previousRow) {
+        throw new Error(
+          `no account registration found for (comm=${input.comm}, bot-id=${input.bot_user_id})`
+        );
+      }
+      const previous = this.accountFromRow(previousRow);
+      if (previous.activation === input.activation) {
+        this.db.exec("COMMIT");
+        return { previous, next: previous };
+      }
+      const result = this.db.prepare(`
+          UPDATE account_registrations
+          SET activation = ?,
+              updated_at = ?
+          WHERE registration_id = ?
+        `).run(input.activation, input.updated_at, previous.registration_id);
+      if (Number(result.changes ?? 0) !== 1) {
+        throw new Error(
+          `failed to update activation for account registration ${previous.registration_id}`
         );
       }
       const nextRow = this.db.prepare("SELECT * FROM account_registrations WHERE registration_id = ?").get(previous.registration_id);
@@ -4358,12 +4629,12 @@ var SqliteStorage = class _SqliteStorage {
           schema_version, session_id, agent, project, created_at,
           lease_holder_connection_id, lease_acquired_at, lease_released_at,
           lease_owner_process_pid, lease_owner_process_label,
-          lease_owner_process_registered_at,
+          lease_owner_process_registered_at, lease_owner_process_start_time,
           lease_owner_daemon_discovery_root, lease_owner_daemon_checkout_root,
           lease_owner_daemon_state_root, lease_owner_daemon_bin,
           lease_owner_daemon_authority_rank,
           most_recent_inbound_conversation_id, account_label_scope, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id) DO UPDATE SET
           agent = excluded.agent,
           project = excluded.project,
@@ -4381,6 +4652,7 @@ var SqliteStorage = class _SqliteStorage {
       rec.lease_owner_process_pid,
       rec.lease_owner_process_label,
       rec.lease_owner_process_registered_at,
+      rec.lease_owner_process_start_time ?? null,
       rec.lease_owner_daemon_discovery_root,
       rec.lease_owner_daemon_checkout_root,
       rec.lease_owner_daemon_state_root,
@@ -4392,6 +4664,12 @@ var SqliteStorage = class _SqliteStorage {
     );
   }
   async acquireSessionLease(session, connection_id, at, owner) {
+    const ownerPid = owner?.process_pid ?? null;
+    let ownerStartTime = owner?.process_start_time ?? null;
+    if (ownerPid != null && ownerStartTime == null) {
+      await prefetchProcessStartIdentity([ownerPid]);
+      ownerStartTime = readProcessStartEpochMs(ownerPid);
+    }
     try {
       const result = this.db.prepare(`
           UPDATE sessions
@@ -4407,6 +4685,7 @@ var SqliteStorage = class _SqliteStorage {
               lease_owner_process_pid = ?,
               lease_owner_process_label = ?,
               lease_owner_process_registered_at = ?,
+              lease_owner_process_start_time = ?,
               lease_owner_daemon_discovery_root = ?,
               lease_owner_daemon_checkout_root = ?,
               lease_owner_daemon_state_root = ?,
@@ -4417,9 +4696,10 @@ var SqliteStorage = class _SqliteStorage {
         `).run(
         connection_id,
         at,
-        owner?.process_pid ?? null,
+        ownerPid,
         owner?.process_label ?? null,
-        owner?.process_pid ? at : null,
+        ownerPid ? at : null,
+        ownerPid ? ownerStartTime : null,
         owner?.daemon?.discovery_root ?? null,
         owner?.daemon?.checkout_root ?? null,
         owner?.daemon?.state_root ?? null,
@@ -4442,6 +4722,7 @@ var SqliteStorage = class _SqliteStorage {
             lease_owner_process_pid = NULL,
             lease_owner_process_label = NULL,
             lease_owner_process_registered_at = NULL,
+            lease_owner_process_start_time = NULL,
             lease_owner_daemon_discovery_root = NULL,
             lease_owner_daemon_checkout_root = NULL,
             lease_owner_daemon_state_root = NULL,
@@ -4478,6 +4759,10 @@ var SqliteStorage = class _SqliteStorage {
             (lease_owner_process_registered_at IS NULL AND ? IS NULL)
             OR lease_owner_process_registered_at = ?
           )
+          AND (
+            (lease_owner_process_start_time IS NULL AND ? IS NULL)
+            OR lease_owner_process_start_time = ?
+          )
       `).run(
       at,
       session,
@@ -4487,7 +4772,9 @@ var SqliteStorage = class _SqliteStorage {
       observed.lease_owner_process_pid,
       observed.lease_owner_process_pid,
       observed.lease_owner_process_registered_at,
-      observed.lease_owner_process_registered_at
+      observed.lease_owner_process_registered_at,
+      observed.lease_owner_process_start_time,
+      observed.lease_owner_process_start_time
     );
     return Number(result.changes ?? 0) > 0;
   }
@@ -4526,6 +4813,101 @@ var SqliteStorage = class _SqliteStorage {
         SET most_recent_inbound_conversation_id = ?
         WHERE session_id = ?
       `).run(conversation_id, session);
+  }
+  async setSessionWakeTarget(session, identity, wake_strict) {
+    const sets = [];
+    const params = [];
+    if (identity !== void 0) {
+      sets.push("wake_identity_json = ?");
+      params.push(
+        identity == null ? null : JSON.stringify(identity)
+      );
+    }
+    if (wake_strict !== void 0) {
+      sets.push("wake_strict = ?");
+      params.push(wake_strict);
+    }
+    if (sets.length === 0) return;
+    params.push(session);
+    this.db.prepare(`UPDATE sessions SET ${sets.join(", ")} WHERE session_id = ?`).run(...params);
+  }
+  async getWakeMode(project, agent) {
+    const canonical = project === "" ? "" : normalizeProjectPath(project);
+    const scoped = this.db.prepare(
+      "SELECT mode FROM wake_preferences WHERE project = ? AND agent = ?"
+    ).get(canonical, agent);
+    if (scoped?.mode === "auto" || scoped?.mode === "native") {
+      return scoped.mode;
+    }
+    const global = this.db.prepare("SELECT mode FROM wake_preferences WHERE project = '' AND agent = ?").get(agent);
+    if (global?.mode === "auto" || global?.mode === "native") {
+      return global.mode;
+    }
+    return "auto";
+  }
+  async setWakeMode(project, agent, mode, updated_at) {
+    const canonical = project === "" ? "" : normalizeProjectPath(project);
+    this.db.prepare(`
+        INSERT INTO wake_preferences (project, agent, mode, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(project, agent) DO UPDATE SET
+          mode = excluded.mode,
+          updated_at = excluded.updated_at
+      `).run(canonical, agent, mode, updated_at);
+  }
+  async clearWakeMode(project, agent) {
+    const canonical = project === "" ? "" : normalizeProjectPath(project);
+    this.db.prepare("DELETE FROM wake_preferences WHERE project = ? AND agent = ?").run(canonical, agent);
+  }
+  async listWakeModes() {
+    const rows = this.db.prepare("SELECT project, agent, mode, updated_at FROM wake_preferences ORDER BY project, agent").all();
+    return rows;
+  }
+  async insertSession(rec) {
+    const project = normalizeProjectPath(rec.project);
+    this.db.prepare(`
+        INSERT INTO sessions (
+          schema_version, session_id, agent, project, created_at,
+          lease_holder_connection_id, lease_acquired_at, lease_released_at,
+          lease_owner_process_pid, lease_owner_process_label,
+          lease_owner_process_registered_at, lease_owner_process_start_time,
+          lease_owner_daemon_discovery_root, lease_owner_daemon_checkout_root,
+          lease_owner_daemon_state_root, lease_owner_daemon_bin,
+          lease_owner_daemon_authority_rank,
+          most_recent_inbound_conversation_id, account_label_scope, status,
+          wake_identity_json, wake_strict
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+      rec.schema_version,
+      rec.session_id,
+      rec.agent,
+      project,
+      rec.created_at,
+      rec.lease_holder_connection_id,
+      rec.lease_acquired_at,
+      rec.lease_released_at,
+      rec.lease_owner_process_pid,
+      rec.lease_owner_process_label,
+      rec.lease_owner_process_registered_at,
+      rec.lease_owner_process_start_time ?? null,
+      rec.lease_owner_daemon_discovery_root,
+      rec.lease_owner_daemon_checkout_root,
+      rec.lease_owner_daemon_state_root,
+      rec.lease_owner_daemon_bin,
+      rec.lease_owner_daemon_authority_rank,
+      rec.most_recent_inbound_conversation_id,
+      rec.account_label_scope ?? null,
+      rec.status,
+      rec.wake_identity ? JSON.stringify(rec.wake_identity) : null,
+      rec.wake_strict
+    );
+  }
+  async reactivateSessionIfEnded(session) {
+    const result = this.db.prepare(`
+        UPDATE sessions SET status = 'active'
+        WHERE session_id = ? AND status = 'ended'
+      `).run(session);
+    return Number(result.changes ?? 0) > 0;
   }
   async addAllowlistGlobal(rec) {
     this.db.prepare(`
@@ -4621,6 +5003,134 @@ var SqliteStorage = class _SqliteStorage {
       stmt.run(key.conversation_id, key.message_id, key.comm, key.account);
     }
   }
+  async reserveCurlInboundReceipt(input) {
+    const existing = await this.getCurlInboundReceipt(input);
+    if (existing) {
+      if (existing.state === "accepted" && existing.expires_at <= input.reserved_at) {
+        this.db.prepare(`
+            DELETE FROM curl_inbound_receipts
+            WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+          `).run(input.registration_id, input.sender_id, input.client_key);
+      } else if (existing.request_hash !== input.request_hash) {
+        return { kind: "conflict" };
+      } else if (existing.state === "accepted") {
+        return {
+          kind: "replay",
+          message_id: existing.message_id,
+          conversation_id: existing.conversation_id
+        };
+      } else {
+        return {
+          kind: "resume",
+          message_id: existing.message_id,
+          conversation_id: existing.conversation_id
+        };
+      }
+    }
+    try {
+      this.db.prepare(`
+          INSERT INTO curl_inbound_receipts (
+            registration_id, sender_id, client_key, request_hash, message_id,
+            conversation_id, state, reserved_at, accepted_at, expires_at,
+            transcript_recorded_at, audit_recorded_at, dispatch_recorded_at,
+            query_consumed_at, planned_query_id
+          ) VALUES (?, ?, ?, ?, ?, NULL, 'pending', ?, NULL, ?, NULL, NULL, NULL, NULL, NULL)
+        `).run(
+        input.registration_id,
+        input.sender_id,
+        input.client_key,
+        input.request_hash,
+        input.message_id,
+        input.reserved_at,
+        input.expires_at
+      );
+      return { kind: "reserved", message_id: input.message_id };
+    } catch (error) {
+      if (!isSqliteUniqueViolation(error)) throw error;
+      return this.reserveCurlInboundReceipt(input);
+    }
+  }
+  async acceptCurlInboundReceipt(input) {
+    const result = this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET state = 'accepted',
+            conversation_id = ?,
+            accepted_at = ?
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+          AND state = 'pending'
+      `).run(
+      input.conversation_id,
+      input.accepted_at,
+      input.registration_id,
+      input.sender_id,
+      input.client_key
+    );
+    return (result.changes ?? 0) === 1;
+  }
+  async getCurlInboundReceipt(scope) {
+    const row = this.db.prepare(`
+        SELECT * FROM curl_inbound_receipts
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `).get(scope.registration_id, scope.sender_id, scope.client_key);
+    return row ? this.curlInboundReceiptFromRow(row) : null;
+  }
+  async deleteExpiredCurlInboundReceipts(now) {
+    const result = this.db.prepare(
+      "DELETE FROM curl_inbound_receipts WHERE state = 'accepted' AND expires_at <= ?"
+    ).run(now);
+    return result.changes ?? 0;
+  }
+  async markCurlReceiptConversation(scope, conversation_id) {
+    this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET conversation_id = COALESCE(conversation_id, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `).run(conversation_id, scope.registration_id, scope.sender_id, scope.client_key);
+  }
+  async markCurlReceiptTranscript(scope, at) {
+    this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET transcript_recorded_at = COALESCE(transcript_recorded_at, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `).run(at, scope.registration_id, scope.sender_id, scope.client_key);
+  }
+  async markCurlReceiptAudit(scope, at) {
+    this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET audit_recorded_at = COALESCE(audit_recorded_at, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `).run(at, scope.registration_id, scope.sender_id, scope.client_key);
+  }
+  async markCurlReceiptDispatch(scope, at) {
+    this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET dispatch_recorded_at = COALESCE(dispatch_recorded_at, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `).run(at, scope.registration_id, scope.sender_id, scope.client_key);
+  }
+  async markCurlReceiptQueryConsumed(scope, at) {
+    this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET query_consumed_at = COALESCE(query_consumed_at, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `).run(at, scope.registration_id, scope.sender_id, scope.client_key);
+  }
+  async markCurlReceiptPlannedQuery(scope, query_id) {
+    this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET planned_query_id = ?
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+          AND planned_query_id IS NULL
+      `).run(query_id, scope.registration_id, scope.sender_id, scope.client_key);
+  }
+  async hasPendingInboundDelivery(key) {
+    const row = this.db.prepare(`
+        SELECT 1 AS present FROM pending_inbound_deliveries
+        WHERE conversation_id = ? AND message_id = ? AND comm = ? AND account = ?
+        LIMIT 1
+      `).get(key.conversation_id, key.message_id, key.comm, key.account);
+    return row != null;
+  }
   async close() {
     this.db.close();
   }
@@ -4656,6 +5166,7 @@ var SqliteStorage = class _SqliteStorage {
       account_label: r.account_label,
       bot_user_id: r.bot_user_id,
       credentials_ref: r.credentials_ref,
+      activation: r.activation ?? "lazy",
       bot_username: r.bot_username ?? void 0,
       created_at: r.created_at,
       updated_at: r.updated_at,
@@ -4702,6 +5213,26 @@ var SqliteStorage = class _SqliteStorage {
       options_json: r.options_json
     };
   }
+  curlInboundReceiptFromRow(row) {
+    const r = row;
+    return {
+      registration_id: r.registration_id,
+      sender_id: r.sender_id,
+      client_key: r.client_key,
+      request_hash: r.request_hash,
+      message_id: r.message_id,
+      conversation_id: r.conversation_id ?? null,
+      state: r.state,
+      reserved_at: r.reserved_at,
+      accepted_at: r.accepted_at ?? null,
+      expires_at: r.expires_at,
+      transcript_recorded_at: r.transcript_recorded_at ?? null,
+      audit_recorded_at: r.audit_recorded_at ?? null,
+      dispatch_recorded_at: r.dispatch_recorded_at ?? null,
+      query_consumed_at: r.query_consumed_at ?? null,
+      planned_query_id: r.planned_query_id ?? null
+    };
+  }
   pendingInboundDeliveryFromRow(row) {
     const r = row;
     return {
@@ -4728,6 +5259,7 @@ var SqliteStorage = class _SqliteStorage {
       lease_owner_process_pid: r.lease_owner_process_pid,
       lease_owner_process_label: r.lease_owner_process_label,
       lease_owner_process_registered_at: r.lease_owner_process_registered_at,
+      lease_owner_process_start_time: r.lease_owner_process_start_time,
       lease_owner_daemon_discovery_root: r.lease_owner_daemon_discovery_root,
       lease_owner_daemon_checkout_root: r.lease_owner_daemon_checkout_root,
       lease_owner_daemon_state_root: r.lease_owner_daemon_state_root,
@@ -4735,12 +5267,19 @@ var SqliteStorage = class _SqliteStorage {
       lease_owner_daemon_authority_rank: r.lease_owner_daemon_authority_rank,
       most_recent_inbound_conversation_id: r.most_recent_inbound_conversation_id,
       account_label_scope: r.account_label_scope ?? null,
-      status: r.status
+      status: r.status,
+      wake_identity: parseHerdrIdentityJson(r.wake_identity_json),
+      wake_strict: r.wake_strict === "herdr" ? "herdr" : null
     };
   }
 };
-async function openSqliteStorage(path13) {
-  return SqliteStorage.open(path13);
+function isSqliteUniqueViolation(error) {
+  if (error == null || typeof error !== "object") return false;
+  const sqliteError = error;
+  return sqliteError.code === "SQLITE_CONSTRAINT_UNIQUE" || sqliteError.code === "SQLITE_CONSTRAINT_PRIMARYKEY" || sqliteError.errcode === 2067 || sqliteError.errcode === 1555;
+}
+async function openSqliteStorage(path15) {
+  return SqliteStorage.open(path15);
 }
 function isConstraintError(error) {
   const sqliteError = error;
@@ -4986,22 +5525,24 @@ async function sendRequest(socket, request, requestTimeoutMs) {
 
 // ../core-daemon/host-runtime/entry-ensures.ts
 import { existsSync as existsSync4 } from "node:fs";
-import path10 from "node:path";
+import path12 from "node:path";
 
 // ../core-daemon/bootstrap/ensure-daemon.ts
 import { spawn } from "node:child_process";
 import { closeSync, mkdirSync, openSync } from "node:fs";
-import { mkdir as mkdir3, readFile as readFile4, rm as rm2, writeFile } from "node:fs/promises";
-import path4 from "node:path";
+import { mkdir as mkdir5, open as open3, readFile as readFile6, rm as rm4 } from "node:fs/promises";
+import path6 from "node:path";
 
 // ../core-daemon/storage/audit.ts
+import { createReadStream } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname as dirname2, join as join2 } from "node:path";
+import { createInterface } from "node:readline/promises";
 
 // ../core-daemon/storage/jsonl.ts
 import { open } from "node:fs/promises";
-async function appendJsonLine(path13, value) {
-  const handle = await open(path13, "a");
+async function appendJsonLine(path15, value) {
+  const handle = await open(path15, "a");
   try {
     await handle.writeFile(`${JSON.stringify(value)}
 `, "utf8");
@@ -5021,12 +5562,31 @@ var JsonlAuditStore = class {
   }
   root;
   async append(event) {
-    const path13 = this.pathFor(event.timestamp);
-    await mkdir(dirname2(path13), { recursive: true });
-    await appendJsonLine(path13, event);
+    const path15 = this.pathFor(event.timestamp);
+    await mkdir(dirname2(path15), { recursive: true });
+    await appendJsonLine(path15, event);
   }
   pathFor(timestamp) {
     return join2(this.root, "audit", `${utcDay(timestamp)}.jsonl`);
+  }
+  async hasInboundReceived(conversation_id, message, auditTimestamp) {
+    const path15 = this.pathFor(auditTimestamp ?? Date.now());
+    try {
+      const lines = createInterface({
+        input: createReadStream(path15, { encoding: "utf8" }),
+        crlfDelay: Infinity
+      });
+      for await (const line of lines) {
+        if (line.trim() === "") continue;
+        const event = JSON.parse(line);
+        if (event.kind === "inbound_received" && event.conversation_id === conversation_id && event.detail?.platform_message_id === message.platform_message_id) {
+          return true;
+        }
+      }
+    } catch {
+      return false;
+    }
+    return false;
   }
 };
 
@@ -5156,17 +5716,319 @@ function isAlreadyExistsError(error) {
   return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
 }
 
+// ../core-daemon/bootstrap/discovery-claim.ts
+import { mkdir as mkdir4, readFile as readFile5, rename as rename2, rm as rm3, writeFile as writeFile2, link as link2 } from "node:fs/promises";
+import path5 from "node:path";
+
+// ../core-daemon/bootstrap/discovery-guard.ts
+import { randomUUID } from "node:crypto";
+import { mkdir as mkdir3, readFile as readFile4, rename, rm as rm2, stat, writeFile, link } from "node:fs/promises";
+import path4 from "node:path";
+var GUARD_FILE = "owner.lock";
+var RECLAIM_FILE = "owner.lock.reclaim";
+var RECLAIM2_FILE = "owner.lock.reclaim2";
+var RETRY_MS = 20;
+var DEFAULT_MAX_WAIT_MS = 2e3;
+var loggedDeadReclaim2Paths = /* @__PURE__ */ new Set();
+function discoveryGuardFile(discoveryRoot2) {
+  return path4.join(discoveryRoot2, GUARD_FILE);
+}
+function discoveryReclaimLockFile(discoveryRoot2) {
+  return path4.join(discoveryRoot2, RECLAIM_FILE);
+}
+function discoveryReclaim2LockFile(discoveryRoot2) {
+  return path4.join(discoveryRoot2, RECLAIM2_FILE);
+}
+function parseDiscoveryGuardToken(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed) return void 0;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (typeof parsed.pid !== "number" || !Number.isInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.at !== "number" || !Number.isFinite(parsed.at)) {
+      return void 0;
+    }
+    const startedAt = parsed.startedAt === null || parsed.startedAt === void 0 ? null : typeof parsed.startedAt === "number" && Number.isFinite(parsed.startedAt) ? parsed.startedAt : void 0;
+    if (startedAt === void 0 && parsed.startedAt !== null && parsed.startedAt !== void 0) {
+      return void 0;
+    }
+    const nonce = typeof parsed.nonce === "string" ? parsed.nonce : "";
+    return { pid: parsed.pid, startedAt: startedAt ?? null, at: parsed.at, nonce };
+  } catch {
+    return void 0;
+  }
+}
+function guardTokensEqual(a, b) {
+  return a.pid === b.pid && a.startedAt === b.startedAt && a.at === b.at && a.nonce === b.nonce;
+}
+async function withDiscoveryGuard(discoveryRoot2, self, fn, options = {}) {
+  await mkdir3(discoveryRoot2, { recursive: true });
+  const isPidAlive = options.isPidAlive ?? defaultIsPidAlive2;
+  const deadline = Date.now() + (options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS);
+  let acquiredToken;
+  while (Date.now() <= deadline) {
+    const attempt = await tryAcquireGuard(discoveryRoot2, self, isPidAlive, options);
+    if (attempt.kind === "acquired") {
+      acquiredToken = attempt.token;
+      try {
+        return { ok: true, value: await fn() };
+      } finally {
+        await releaseGuardIfTokenMatches(discoveryGuardFile(discoveryRoot2), acquiredToken);
+      }
+    }
+    if (attempt.kind === "contended") {
+      await sleep(RETRY_MS);
+      continue;
+    }
+    return { ok: false, reason: "guard_contended" };
+  }
+  return { ok: false, reason: "guard_contended" };
+}
+async function tryAcquireGuard(discoveryRoot2, self, isPidAlive, options) {
+  const reclaim2Raw = await readGuardRaw(discoveryReclaim2LockFile(discoveryRoot2));
+  if (reclaim2Raw !== null) {
+    const reclaim2 = parseDiscoveryGuardToken(reclaim2Raw);
+    if (reclaim2 && !isPidAlive(reclaim2.pid)) {
+      logDeadReclaim2Once(discoveryReclaim2LockFile(discoveryRoot2));
+    }
+    return { kind: "failed" };
+  }
+  const guardPath = discoveryGuardFile(discoveryRoot2);
+  const token = buildGuardToken(self, options.now);
+  const published = await publishFileViaLink(guardPath, token, self.pid, options);
+  if (published === "ok") {
+    return { kind: "acquired", token };
+  }
+  const raw = await readGuardRaw(guardPath);
+  if (raw === null) {
+    return { kind: "contended" };
+  }
+  const existing = parseDiscoveryGuardToken(raw);
+  if (!existing) {
+    return { kind: "contended" };
+  }
+  if (existing.pid === self.pid) {
+    return { kind: "contended" };
+  }
+  if (isPidAlive(existing.pid)) {
+    return { kind: "contended" };
+  }
+  await options.beforeReclaim?.();
+  const reclaimed = await reclaimDeadGuard(discoveryRoot2, self, existing, isPidAlive, options);
+  return reclaimed ? { kind: "contended" } : { kind: "failed" };
+}
+async function reclaimDeadGuard(discoveryRoot2, self, deadToken, isPidAlive, options) {
+  const reclaimHeld = await tryAcquireReclaimLock(discoveryRoot2, self, isPidAlive, options);
+  if (!reclaimHeld) return false;
+  try {
+    await options.beforeQuarantine?.();
+    return await quarantineVerifiedGuard(discoveryRoot2, self, deadToken, options);
+  } finally {
+    await releaseGuardIfTokenMatches(discoveryReclaimLockFile(discoveryRoot2), reclaimHeld);
+  }
+}
+async function tryAcquireReclaimLock(discoveryRoot2, self, isPidAlive, options) {
+  const reclaimPath = discoveryReclaimLockFile(discoveryRoot2);
+  const reclaimToken = buildGuardToken({ pid: self.pid, startedAt: self.startedAt }, options.now);
+  if (await publishFileViaLink(reclaimPath, reclaimToken, self.pid, options) === "ok") {
+    return reclaimToken;
+  }
+  const raw = await readGuardRaw(reclaimPath);
+  if (!raw) return void 0;
+  const existing = parseDiscoveryGuardToken(raw);
+  if (!existing) return void 0;
+  if (isPidAlive(existing.pid)) return void 0;
+  await options.beforeReclaim2?.();
+  const recovered = await recoverDeadReclaimLockUnderReclaim2(
+    discoveryRoot2,
+    self,
+    existing,
+    isPidAlive,
+    options
+  );
+  if (!recovered) return void 0;
+  const retryToken = buildGuardToken({ pid: self.pid, startedAt: self.startedAt }, options.now);
+  if (await publishFileViaLink(reclaimPath, retryToken, self.pid, options) === "ok") {
+    return retryToken;
+  }
+  return void 0;
+}
+async function recoverDeadReclaimLockUnderReclaim2(discoveryRoot2, self, expectedDeadToken, isPidAlive, options) {
+  const reclaim2Path = discoveryReclaim2LockFile(discoveryRoot2);
+  const reclaim2Raw = await readGuardRaw(reclaim2Path);
+  if (reclaim2Raw !== null) {
+    const reclaim2 = parseDiscoveryGuardToken(reclaim2Raw);
+    if (reclaim2 && !isPidAlive(reclaim2.pid)) {
+      logDeadReclaim2Once(reclaim2Path);
+    }
+    return false;
+  }
+  const reclaim2Token = buildGuardToken({ pid: self.pid, startedAt: self.startedAt }, options.now);
+  if (await publishFileViaLink(reclaim2Path, reclaim2Token, self.pid, options) !== "ok") {
+    return false;
+  }
+  const reclaimPath = discoveryReclaimLockFile(discoveryRoot2);
+  try {
+    const reread = await readGuardRaw(reclaimPath);
+    const current = reread ? parseDiscoveryGuardToken(reread) : void 0;
+    if (!current || !guardTokensEqual(current, expectedDeadToken)) {
+      return false;
+    }
+    return await quarantineVerifiedGuardFile(reclaimPath, self, expectedDeadToken, options.now);
+  } finally {
+    await releaseGuardIfTokenMatches(reclaim2Path, reclaim2Token);
+  }
+}
+function logDeadReclaim2Once(reclaim2Path) {
+  if (loggedDeadReclaim2Paths.has(reclaim2Path)) return;
+  loggedDeadReclaim2Paths.add(reclaim2Path);
+  console.error(`dead discovery reclaim2 token at ${reclaim2Path}; manual cleanup required`);
+}
+async function quarantineVerifiedGuard(discoveryRoot2, self, expectedDeadToken, options) {
+  return quarantineVerifiedGuardFile(
+    discoveryGuardFile(discoveryRoot2),
+    self,
+    expectedDeadToken,
+    options.now
+  );
+}
+async function quarantineVerifiedGuardFile(guardPath, self, expectedDeadToken, now) {
+  const raw = await readGuardRaw(guardPath);
+  if (!raw) return false;
+  const current = parseDiscoveryGuardToken(raw);
+  if (!current || !guardTokensEqual(current, expectedDeadToken)) {
+    return false;
+  }
+  const clock = now ?? Date.now;
+  const stalePath = `${guardPath}.stale.${self.pid}.${clock()}`;
+  try {
+    await rename(guardPath, stalePath);
+  } catch {
+    return false;
+  }
+  await rm2(stalePath, { force: true });
+  return true;
+}
+async function publishFileViaLink(targetPath, content, selfPid, options = {}) {
+  const clock = options.now ?? Date.now;
+  const tempPath = `${targetPath}.tmp.${selfPid}.${clock()}.${randomUUID()}`;
+  try {
+    await writeFile(tempPath, content, { encoding: "utf8", flag: "wx" });
+    await options.beforeGuardLink?.();
+    try {
+      await link(tempPath, targetPath);
+      return "ok";
+    } catch (error) {
+      if (isAlreadyExistsError2(error)) return "eexist";
+      throw error;
+    }
+  } finally {
+    await rm2(tempPath, { force: true });
+  }
+}
+function buildGuardToken(self, now) {
+  const clock = now ?? Date.now;
+  const token = {
+    pid: self.pid,
+    startedAt: self.startedAt,
+    at: clock(),
+    nonce: randomUUID()
+  };
+  return `${JSON.stringify(token)}
+`;
+}
+async function readGuardRaw(filePath) {
+  try {
+    return await readFile4(filePath, "utf8");
+  } catch {
+    return null;
+  }
+}
+async function releaseGuardIfTokenMatches(guardPath, expectedToken) {
+  try {
+    const current = await readFile4(guardPath, "utf8");
+    if (current !== expectedToken) return;
+    await rm2(guardPath, { force: true });
+  } catch {
+  }
+}
+function defaultIsPidAlive2(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+}
+function isAlreadyExistsError2(error) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+}
+function sleep(ms) {
+  return new Promise((resolve3) => setTimeout(resolve3, ms));
+}
+
+// ../core-daemon/bootstrap/discovery-claim.ts
+var OWNER_FILE = "owner.json";
+function discoveryOwnerFile(discoveryRoot2) {
+  return path5.join(discoveryRoot2, OWNER_FILE);
+}
+async function readDiscoveryClaim(discoveryRoot2) {
+  const read = await readDiscoveryClaimRaw(discoveryRoot2);
+  return read?.claim;
+}
+async function readDiscoveryClaimRaw(discoveryRoot2) {
+  try {
+    const raw = await readFile5(discoveryOwnerFile(discoveryRoot2), "utf8");
+    if (raw.length === 0) return void 0;
+    const claim = parseDiscoveryClaim(raw);
+    if (!claim) return void 0;
+    return { raw, claim };
+  } catch {
+    return void 0;
+  }
+}
+function parseDiscoveryClaim(raw) {
+  if (raw.length === 0) return void 0;
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.pid !== "number" || !Number.isInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.port !== "number" || !Number.isInteger(parsed.port) || parsed.port <= 0 || parsed.port >= 65536 || typeof parsed.stateRoot !== "string" || parsed.stateRoot.length === 0 || typeof parsed.protocolVersion !== "string" || parsed.protocolVersion.length === 0) {
+      return void 0;
+    }
+    const startedAt = parsed.startedAt === null || parsed.startedAt === void 0 ? null : typeof parsed.startedAt === "number" && Number.isFinite(parsed.startedAt) ? parsed.startedAt : void 0;
+    if (startedAt === void 0 && parsed.startedAt !== null && parsed.startedAt !== void 0) {
+      return void 0;
+    }
+    const nonce = typeof parsed.nonce === "string" ? parsed.nonce : void 0;
+    return {
+      pid: parsed.pid,
+      port: parsed.port,
+      stateRoot: parsed.stateRoot,
+      startedAt: startedAt ?? null,
+      protocolVersion: parsed.protocolVersion,
+      ...nonce !== void 0 ? { nonce } : {}
+    };
+  } catch {
+    return void 0;
+  }
+}
+
 // ../core-daemon/bootstrap/ensure-daemon.ts
+function claimToIncumbentIdentity(claim) {
+  return { pid: claim.pid, port: claim.port, startedAt: claim.startedAt };
+}
 async function ensureDaemon(options = {}) {
   const env = options.env ?? process.env;
   const stateRoot2 = options.stateRoot ?? env.AGENTS_COMM_BUS_ROOT ?? env.AGENTS_COMM_BUS_STATE_ROOT;
   const paths = resolveStatePaths({ stateRoot: stateRoot2 });
+  const pinsDiscovery = options.stateRoot !== void 0 && options.discoveryRoot === void 0;
   const discoveryPaths = resolveDiscoveryPaths({
     stateRoot: paths.root,
-    discoveryRoot: options.discoveryRoot ?? env.AGENTS_COMM_BUS_DISCOVERY_ROOT
+    discoveryRoot: options.discoveryRoot ?? (pinsDiscovery ? paths.root : env.AGENTS_COMM_BUS_DISCOVERY_ROOT)
   });
-  await mkdir3(paths.root, { recursive: true });
-  await mkdir3(discoveryPaths.root, { recursive: true });
+  if (pinsDiscovery && env.AGENTS_COMM_BUS_DISCOVERY_ROOT) {
+    (options.log ?? console.error)(`agents-comm-bus: ignoring AGENTS_COMM_BUS_DISCOVERY_ROOT=${env.AGENTS_COMM_BUS_DISCOVERY_ROOT}; explicit stateRoot ${paths.root} without discoveryRoot pins discovery to the state root`);
+  }
+  await mkdir5(paths.root, { recursive: true });
+  await mkdir5(discoveryPaths.root, { recursive: true });
   warnIfSourceModeSharesDiscoveryRoot({
     stateRoot: paths.root,
     discoveryRoot: discoveryPaths.root,
@@ -5177,46 +6039,211 @@ async function ensureDaemon(options = {}) {
   const retryMs = options.retryMs ?? DEFAULT_BOOTSTRAP_RETRY_MS;
   const clientProtocolVersion = options.protocolVersion ?? IPC_PROTOCOL_VERSION;
   const deadline = Date.now() + timeoutMs;
-  const probe = options.probeDaemon ?? ((port) => probeDaemon({
-    port,
-    clientVersion: options.clientVersion ?? DAEMON_VERSION,
-    protocolVersion: clientProtocolVersion,
-    metadata: options.metadata,
-    timeoutMs: Math.min(1e3, retryMs * 4)
-  }));
-  const existing = await probeFromPortFile(discoveryPaths.portFile, probe);
+  const isPidAlive = options.isPidAlive ?? defaultIsPidAlive3;
+  let warnedBusy = false;
+  let foreignRoot;
+  let auditedForeign = false;
+  let auditedUnknown = false;
+  let auditedTerminateSkipped = false;
+  const audit = new JsonlAuditStore(paths.root);
+  const probe = async (port) => {
+    const pid = await readPidFile(discoveryPaths.pidFile);
+    const budget = Math.max(1, Math.min(
+      deadline - Date.now(),
+      pid !== void 0 && isPidAlive(pid) ? 5e3 : Math.min(1e3, retryMs * 4)
+    ));
+    let timer;
+    try {
+      return await Promise.race([
+        options.probeDaemon ? options.probeDaemon(port) : probeDaemon({
+          port,
+          clientVersion: options.clientVersion ?? DAEMON_VERSION,
+          protocolVersion: clientProtocolVersion,
+          metadata: options.metadata,
+          timeoutMs: budget
+        }),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("daemon probe timed out")), budget);
+        })
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const probeDiscovery = async () => {
+    const claimRead = await readDiscoveryClaimRaw(discoveryPaths.root);
+    const claim = claimRead?.claim;
+    const incumbent = claim ? claimToIncumbentIdentity(claim) : { pid: await readPidFile(discoveryPaths.pidFile) };
+    if (claim) {
+      const normalizedExpected = normalizeDaemonRootPath(paths.root);
+      const normalizedClaimRoot = normalizeDaemonRootPath(claim.stateRoot);
+      if (normalizedClaimRoot !== normalizedExpected) {
+        foreignRoot = claim.stateRoot;
+        if (!auditedForeign) {
+          auditedForeign = true;
+          await audit.append({
+            timestamp: Date.now(),
+            kind: "daemon_discovery_foreign_state_root",
+            detail: {
+              port: claim.port,
+              pid: claim.pid,
+              expected_state_root: paths.root,
+              reported_state_root: claim.stateRoot
+            }
+          }).catch(() => {
+          });
+        }
+        return void 0;
+      }
+      try {
+        const hello = await probe(claim.port);
+        const reported2 = hello.metadata?.stateRoot;
+        if (typeof reported2 === "string" && reported2.length > 0) {
+          if (normalizeDaemonRootPath(reported2) !== normalizedExpected) {
+            foreignRoot = reported2;
+            if (!auditedForeign) {
+              auditedForeign = true;
+              await audit.append({
+                timestamp: Date.now(),
+                kind: "daemon_discovery_foreign_state_root",
+                detail: {
+                  port: claim.port,
+                  pid: hello.metadata?.pid,
+                  expected_state_root: paths.root,
+                  reported_state_root: reported2
+                }
+              }).catch(() => {
+              });
+            }
+            return void 0;
+          }
+          foreignRoot = void 0;
+        }
+        return {
+          port: claim.port,
+          hello,
+          incumbent,
+          decisionClaim: claim,
+          decisionClaimRaw: claimRead?.raw
+        };
+      } catch (error) {
+        const pid = claim.pid;
+        const dead = !isPidAlive(pid);
+        const refused = error?.code === "ECONNREFUSED";
+        if (foreignRoot === void 0 && (dead || refused)) {
+          return void 0;
+        }
+        if (!dead) {
+          if (!warnedBusy) {
+            warnedBusy = true;
+            (options.log ?? console.error)(`agents-comm-bus: daemon pid ${pid} is alive but unresponsive; waiting`);
+          }
+        }
+        return void 0;
+      }
+    }
+    const found = await probeFromPortFile(discoveryPaths.portFile, probe, {
+      pidFile: discoveryPaths.pidFile,
+      isPidAlive,
+      allowCleanup: () => foreignRoot === void 0,
+      onBusy: (pid) => {
+        if (warnedBusy) return;
+        warnedBusy = true;
+        (options.log ?? console.error)(`agents-comm-bus: daemon pid ${pid} is alive but unresponsive; waiting`);
+      }
+    });
+    if (!found) return void 0;
+    const reported = found.hello.metadata?.stateRoot;
+    if (typeof reported !== "string" || reported.length === 0) {
+      if (!auditedUnknown) {
+        auditedUnknown = true;
+        await audit.append({
+          timestamp: Date.now(),
+          kind: "daemon_discovery_state_root_unknown",
+          detail: { port: found.port, pid: found.hello.metadata?.pid, expected_state_root: paths.root }
+        }).catch(() => {
+        });
+      }
+      const fallbackIncumbent = {
+        pid: found.hello.metadata?.pid ?? incumbent.pid,
+        port: found.port
+      };
+      return { ...found, incumbent: fallbackIncumbent };
+    }
+    if (normalizeDaemonRootPath(reported) === normalizeDaemonRootPath(paths.root)) {
+      foreignRoot = void 0;
+      const matchedIncumbent = {
+        pid: found.hello.metadata?.pid ?? incumbent.pid,
+        port: found.port
+      };
+      return { ...found, incumbent: matchedIncumbent };
+    }
+    foreignRoot = reported;
+    if (!auditedForeign) {
+      auditedForeign = true;
+      await audit.append({
+        timestamp: Date.now(),
+        kind: "daemon_discovery_foreign_state_root",
+        detail: {
+          port: found.port,
+          pid: found.hello.metadata?.pid,
+          expected_state_root: paths.root,
+          reported_state_root: reported
+        }
+      }).catch(() => {
+      });
+    }
+    return void 0;
+  };
+  const existing = await probeDiscovery();
   if (existing) {
     const reuse = classifyDaemonReuse(existing.hello.protocolVersion, clientProtocolVersion);
     if (reuse === "compatible") {
-      return { ...existing, spawned: false };
+      return { port: existing.port, hello: existing.hello, spawned: false };
     }
     if (reuse === "daemon_newer") {
       throw new Error(
         `agents-comm-bus daemon protocol ${existing.hello.protocolVersion} is newer than this client's ${clientProtocolVersion}; restart this session to pick up the newer agent surface`
       );
     }
-    await terminateMismatchedDaemon({
+    const terminated = await terminateMismatchedDaemon({
       paths: discoveryPaths,
+      stateRoot: paths.root,
       livePort: existing.port,
       liveProtocol: existing.hello.protocolVersion,
       clientProtocol: clientProtocolVersion,
+      helloPid: existing.hello.metadata?.pid,
+      incumbent: existing.incumbent,
+      decisionClaim: existing.decisionClaim,
+      decisionClaimRaw: existing.decisionClaimRaw,
       terminateDaemon: options.terminateDaemon ?? defaultTerminateDaemon,
-      isPidAlive: options.isPidAlive ?? defaultIsPidAlive2,
-      retryMs
+      isPidAlive: options.isPidAlive ?? defaultIsPidAlive3,
+      retryMs,
+      audit,
+      auditedTerminateSkipped: () => auditedTerminateSkipped,
+      markTerminateSkippedAudited: () => {
+        auditedTerminateSkipped = true;
+      }
     });
+    if (!terminated) {
+      const retry = await probeDiscovery();
+      if (retry && classifyDaemonReuse(retry.hello.protocolVersion, clientProtocolVersion) === "compatible") {
+        return { port: retry.port, hello: retry.hello, spawned: false };
+      }
+    }
   }
-  const afterTerminate = await probeFromPortFile(discoveryPaths.portFile, probe);
+  const afterTerminate = Date.now() < deadline ? await probeDiscovery() : void 0;
   if (afterTerminate && classifyDaemonReuse(afterTerminate.hello.protocolVersion, clientProtocolVersion) === "compatible") {
-    return { ...afterTerminate, spawned: false };
+    return { port: afterTerminate.port, hello: afterTerminate.hello, spawned: false };
   }
-  await cleanupStalePidAndPort({
+  if (foreignRoot === void 0) await cleanupStalePidAndPort({
     stateRoot: paths.root,
+    discoveryRoot: discoveryPaths.root,
     pidFile: discoveryPaths.pidFile,
     portFile: discoveryPaths.portFile,
-    isPidAlive: options.isPidAlive ?? defaultIsPidAlive2
+    isPidAlive: options.isPidAlive ?? defaultIsPidAlive3
   });
   let spawned = false;
-  const isPidAlive = options.isPidAlive ?? defaultIsPidAlive2;
   const spawnLockOptions = {
     isPidAlive,
     staleTimeoutMs: defaultSpawnLockStaleTimeoutMs(timeoutMs)
@@ -5225,17 +6252,32 @@ async function ensureDaemon(options = {}) {
     const lock = await tryAcquireSpawnLock(discoveryPaths.spawnLock, spawnLockOptions);
     if (lock) {
       try {
-        const recheck = await probeFromPortFile(discoveryPaths.portFile, probe);
+        const recheck = compatibleDiscoveryResult(await probeDiscovery(), clientProtocolVersion);
         if (recheck) {
           return { ...recheck, spawned };
         }
+        const claim = await readDiscoveryClaim(discoveryPaths.root);
+        const incumbentPid = claim?.pid ?? await readPidFile(discoveryPaths.pidFile);
+        const foreignSquatter = foreignRoot !== void 0;
+        if (!foreignSquatter && incumbentPid !== void 0 && isPidAlive(incumbentPid)) {
+          const found3 = compatibleDiscoveryResult(
+            await waitForDaemon(probeDiscovery, deadline, retryMs),
+            clientProtocolVersion
+          );
+          if (found3) return { ...found3, spawned };
+          break;
+        }
+        if (Date.now() >= deadline) break;
         if (options.spawnDaemon) {
           await options.spawnDaemon(paths, discoveryPaths);
         } else {
           defaultSpawnDaemon(paths, discoveryPaths, env);
         }
         spawned = true;
-        const found2 = await waitForDaemon(discoveryPaths.portFile, probe, deadline, retryMs);
+        const found2 = compatibleDiscoveryResult(
+          await waitForDaemon(probeDiscovery, deadline, retryMs),
+          clientProtocolVersion
+        );
         if (found2) {
           return { ...found2, spawned: true };
         }
@@ -5243,67 +6285,221 @@ async function ensureDaemon(options = {}) {
         await lock.release();
       }
     }
-    const found = await waitForDaemon(discoveryPaths.portFile, probe, deadline, retryMs);
+    const found = compatibleDiscoveryResult(
+      await waitForDaemon(probeDiscovery, deadline, retryMs),
+      clientProtocolVersion
+    );
     if (found) {
       return { ...found, spawned };
     }
-    await cleanupStalePidAndPort({
+    if (foreignRoot === void 0) await cleanupStalePidAndPort({
       stateRoot: paths.root,
+      discoveryRoot: discoveryPaths.root,
       pidFile: discoveryPaths.pidFile,
       portFile: discoveryPaths.portFile,
       isPidAlive
     });
     await removeStaleSpawnLock(discoveryPaths.spawnLock, spawnLockOptions);
   }
-  throw new Error(`Timed out starting agents-comm-bus daemon under ${discoveryPaths.root}.`);
+  const finalClaim = await readDiscoveryClaim(discoveryPaths.root);
+  const finalPidFile = await readPidFile(discoveryPaths.pidFile);
+  const livePid = finalClaim?.pid !== void 0 && isPidAlive(finalClaim.pid) ? finalClaim.pid : finalPidFile !== void 0 && isPidAlive(finalPidFile) ? finalPidFile : void 0;
+  return await throwDaemonBootstrapTimeoutError(discoveryPaths.root, paths.root, livePid, foreignRoot);
+}
+var DAEMON_STDERR_LOG_TAIL_MAX_BYTES = 4096;
+async function readBoundedDaemonStderrTail(stateRoot2) {
+  const logPath = daemonStderrLogPath(stateRoot2);
+  let handle;
+  try {
+    handle = await open3(logPath, "r");
+    const fileStat = await handle.stat();
+    if (fileStat.size === 0) return "";
+    const readStart = Math.max(0, fileStat.size - DAEMON_STDERR_LOG_TAIL_MAX_BYTES);
+    const readLength = fileStat.size - readStart;
+    const buffer = Buffer.alloc(readLength);
+    const { bytesRead } = await handle.read(buffer, 0, readLength, readStart);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => {
+    });
+  }
+}
+async function throwDaemonBootstrapTimeoutError(discoveryRoot2, stateRoot2, livePid, foreignRoot) {
+  const logPath = daemonStderrLogPath(stateRoot2);
+  let message = `Timed out starting agents-comm-bus daemon under ${discoveryRoot2}.`;
+  if (livePid !== void 0) message += ` Daemon pid ${livePid} is alive but unresponsive; no replacement spawned.`;
+  if (foreignRoot !== void 0) {
+    message += ` Discovery reports foreign state root ${foreignRoot}; spawn may replace the squatter.`;
+  }
+  message += `
+Daemon stderr log: ${logPath}`;
+  const tail = await readBoundedDaemonStderrTail(stateRoot2);
+  if (tail === null) {
+    message += " (log unavailable)";
+  } else if (tail.length === 0) {
+    message += " (log empty)";
+  } else {
+    message += `
+--- recent stderr (last ${DAEMON_STDERR_LOG_TAIL_MAX_BYTES} bytes) ---
+${tail}
+--- end stderr ---`;
+  }
+  throw new Error(message);
 }
 function classifyDaemonReuse(daemonProtocol, clientProtocol) {
   if (isProtocolCompatible(daemonProtocol, clientProtocol)) return "compatible";
   return Number(protocolMajor(daemonProtocol)) > Number(protocolMajor(clientProtocol)) ? "daemon_newer" : "daemon_older";
 }
-async function terminateMismatchedDaemon(input) {
-  const pid = await readPidFile(input.paths.pidFile);
-  if (pid === void 0) {
-    throw new Error(
-      `agents-comm-bus daemon on port ${input.livePort} speaks incompatible IPC protocol ${input.liveProtocol} (client ${input.clientProtocol}); cannot restart because ${input.paths.pidFile} is missing`
-    );
+function compatibleDiscoveryResult(found, clientProtocolVersion) {
+  if (!found) return void 0;
+  if (classifyDaemonReuse(found.hello.protocolVersion, clientProtocolVersion) !== "compatible") {
+    return void 0;
   }
-  await input.terminateDaemon(pid);
-  for (let attempt = 0; attempt < 20 && input.isPidAlive(pid); attempt += 1) {
-    await sleep(input.retryMs);
-  }
-  if (input.isPidAlive(pid)) {
-    throw new Error(
-      `agents-comm-bus daemon pid ${pid} speaks incompatible IPC protocol ${input.liveProtocol} (client ${input.clientProtocol}); failed to terminate old daemon`
-    );
-  }
-  await rm2(input.paths.pidFile, { force: true });
-  await rm2(input.paths.portFile, { force: true });
+  return { port: found.port, hello: found.hello };
 }
-async function probeFromPortFile(portFile, probe) {
+async function terminateMismatchedDaemon(input) {
+  const decisionIncumbent = input.incumbent;
+  const decisionClaim = input.decisionClaim;
+  const decisionClaimRaw = input.decisionClaimRaw;
+  let terminatePid = input.helloPid;
+  if (terminatePid === void 0 || !Number.isInteger(terminatePid) || terminatePid <= 0) {
+    if (!decisionClaim) {
+      const legacyPid = await readPidFile(input.paths.pidFile);
+      if (legacyPid !== void 0) {
+        terminatePid = legacyPid;
+      }
+    }
+  }
+  if (terminatePid === void 0 || !Number.isInteger(terminatePid) || terminatePid <= 0) {
+    if (!input.auditedTerminateSkipped()) {
+      input.markTerminateSkippedAudited();
+      await input.audit.append({
+        timestamp: Date.now(),
+        kind: "daemon_terminate_skipped_identity_unknown",
+        detail: { port: input.livePort, reason: "hello_pid_missing" }
+      }).catch(() => {
+      });
+    }
+    return false;
+  }
+  if (decisionClaim && terminatePid !== decisionClaim.pid) {
+    if (!input.auditedTerminateSkipped()) {
+      input.markTerminateSkippedAudited();
+      await input.audit.append({
+        timestamp: Date.now(),
+        kind: "daemon_terminate_skipped_identity_unknown",
+        detail: { port: input.livePort, claim_pid: decisionClaim.pid, hello_pid: terminatePid }
+      }).catch(() => {
+      });
+    }
+    return false;
+  }
+  if (decisionClaim && decisionClaimRaw !== void 0) {
+    const reread = await readDiscoveryClaimRaw(input.paths.root);
+    if (!reread || reread.raw !== decisionClaimRaw) {
+      if (!input.auditedTerminateSkipped()) {
+        input.markTerminateSkippedAudited();
+        await input.audit.append({
+          timestamp: Date.now(),
+          kind: "daemon_terminate_skipped_identity_unknown",
+          detail: { port: input.livePort, reason: "claim_changed" }
+        }).catch(() => {
+        });
+      }
+      return false;
+    }
+  } else {
+    const ownerPresent = await readDiscoveryClaim(input.paths.root);
+    const legacyPid = await readPidFile(input.paths.pidFile);
+    const legacyPort = await readPortFile(input.paths.portFile);
+    const decisionPid = decisionIncumbent.pid ?? terminatePid;
+    if (ownerPresent !== void 0 || legacyPid !== decisionPid || legacyPort !== input.livePort) {
+      if (!input.auditedTerminateSkipped()) {
+        input.markTerminateSkippedAudited();
+        await input.audit.append({
+          timestamp: Date.now(),
+          kind: "daemon_terminate_skipped_identity_unknown",
+          detail: { port: input.livePort, reason: "legacy_changed" }
+        }).catch(() => {
+        });
+      }
+      return false;
+    }
+  }
+  await input.terminateDaemon(terminatePid);
+  for (let attempt = 0; attempt < 20 && input.isPidAlive(terminatePid); attempt += 1) {
+    await sleep2(input.retryMs);
+  }
+  if (input.isPidAlive(terminatePid)) {
+    throw new Error(
+      `agents-comm-bus daemon pid ${terminatePid} speaks incompatible IPC protocol ${input.liveProtocol} (client ${input.clientProtocol}); failed to terminate old daemon`
+    );
+  }
+  const guardedCleanup = await withDiscoveryGuard(
+    input.paths.root,
+    { pid: process.pid, startedAt: currentProcessStartEpochMs() },
+    async () => {
+      if (decisionClaim && decisionClaimRaw !== void 0) {
+        const reread = await readDiscoveryClaimRaw(input.paths.root);
+        if (!reread || reread.raw !== decisionClaimRaw) {
+          return;
+        }
+        await rm4(discoveryOwnerFile(input.paths.root), { force: true });
+        await rm4(input.paths.pidFile, { force: true });
+        await rm4(input.paths.portFile, { force: true });
+        return;
+      }
+      const ownerPresent = await readDiscoveryClaim(input.paths.root);
+      if (ownerPresent !== void 0) {
+        return;
+      }
+      const legacyPid = await readPidFile(input.paths.pidFile);
+      const legacyPort = await readPortFile(input.paths.portFile);
+      if (legacyPid !== terminatePid || legacyPort !== input.livePort) {
+        return;
+      }
+      await rm4(input.paths.pidFile, { force: true });
+      await rm4(input.paths.portFile, { force: true });
+    },
+    { isPidAlive: input.isPidAlive }
+  );
+  if (!guardedCleanup.ok) {
+  }
+  return true;
+}
+async function probeFromPortFile(portFile, probe, options) {
   const port = await readPortFile(portFile);
   if (port === void 0) {
     return void 0;
   }
   try {
     return { port, hello: await probe(port) };
-  } catch {
-    await rm2(portFile, { force: true });
+  } catch (error) {
+    const pid = await readPidFile(options.pidFile);
+    const dead = pid !== void 0 && !options.isPidAlive(pid);
+    const refused = error?.code === "ECONNREFUSED";
+    if (options.allowCleanup?.() !== false && (dead || refused) && await readPortFile(portFile) === port) {
+      await rm4(portFile, { force: true });
+    } else if (pid !== void 0 && !dead) {
+      options.onBusy(pid);
+    }
     return void 0;
   }
 }
-async function waitForDaemon(portFile, probe, deadline, retryMs) {
+async function waitForDaemon(probeDiscovery, deadline, retryMs) {
   while (Date.now() <= deadline) {
-    const found = await probeFromPortFile(portFile, probe);
+    const found = await probeDiscovery();
     if (found) {
       return found;
     }
-    await sleep(retryMs);
+    await sleep2(retryMs);
   }
   return void 0;
 }
 function daemonStderrLogPath(stateRoot2) {
-  return path4.join(stateRoot2, "daemon.stderr.log");
+  return path6.join(stateRoot2, "daemon.stderr.log");
 }
 function daemonSpawnStdio(stateRoot2) {
   mkdirSync(stateRoot2, { recursive: true });
@@ -5311,22 +6507,39 @@ function daemonSpawnStdio(stateRoot2) {
   return ["ignore", logFd, logFd];
 }
 async function cleanupStalePidAndPort(input) {
-  const pid = await readPidFile(input.pidFile);
-  if (pid !== void 0 && !input.isPidAlive(pid)) {
-    await rm2(input.pidFile, { force: true });
-    await rm2(input.portFile, { force: true });
-    const audit = new JsonlAuditStore(input.stateRoot);
-    await audit.append({
-      timestamp: Date.now(),
-      kind: "discovery_stale_cleanup",
-      detail: { stale_pid: pid, pid_file: input.pidFile, port_file: input.portFile }
-    }).catch(() => {
-    });
+  const owner = await readDiscoveryClaim(input.discoveryRoot);
+  if (owner !== void 0) {
+    return;
+  }
+  const guarded = await withDiscoveryGuard(
+    input.discoveryRoot,
+    { pid: process.pid, startedAt: currentProcessStartEpochMs() },
+    async () => {
+      const ownerInGuard = await readDiscoveryClaim(input.discoveryRoot);
+      if (ownerInGuard !== void 0) {
+        return;
+      }
+      const pid = await readPidFile(input.pidFile);
+      if (pid !== void 0 && !input.isPidAlive(pid)) {
+        await rm4(input.pidFile, { force: true });
+        await rm4(input.portFile, { force: true });
+        const audit = new JsonlAuditStore(input.stateRoot);
+        await audit.append({
+          timestamp: Date.now(),
+          kind: "discovery_stale_cleanup",
+          detail: { stale_pid: pid, pid_file: input.pidFile, port_file: input.portFile }
+        }).catch(() => {
+        });
+      }
+    },
+    { isPidAlive: input.isPidAlive }
+  );
+  if (!guarded.ok) {
   }
 }
 async function readPortFile(portFile) {
   try {
-    const raw = (await readFile4(portFile, "utf8")).trim();
+    const raw = (await readFile6(portFile, "utf8")).trim();
     const port = Number(raw);
     return Number.isInteger(port) && port > 0 && port < 65536 ? port : void 0;
   } catch {
@@ -5335,19 +6548,19 @@ async function readPortFile(portFile) {
 }
 async function readPidFile(pidFile) {
   try {
-    const raw = (await readFile4(pidFile, "utf8")).trim();
+    const raw = (await readFile6(pidFile, "utf8")).trim();
     const pid = Number(raw);
     return Number.isInteger(pid) && pid > 0 ? pid : void 0;
   } catch {
     return void 0;
   }
 }
-function defaultIsPidAlive2(pid) {
+function defaultIsPidAlive3(pid) {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return error.code !== "ESRCH";
   }
 }
 function defaultTerminateDaemon(pid) {
@@ -5358,7 +6571,7 @@ function defaultTerminateDaemon(pid) {
 }
 function defaultSpawnDaemon(paths, discoveryPaths, env = process.env) {
   const binOverride = env.AGENTS_COMM_BUS_BIN;
-  const daemonEntry = binOverride ? path4.resolve(binOverride) : path4.join(paths.root, "bin", "daemon.js");
+  const daemonEntry = binOverride ? path6.resolve(binOverride) : path6.join(paths.root, "bin", "daemon.js");
   const stdio = daemonSpawnStdio(paths.root);
   const child = spawn(process.execPath, [daemonEntry, "serve"], {
     detached: true,
@@ -5377,22 +6590,22 @@ function defaultSpawnDaemon(paths, discoveryPaths, env = process.env) {
 }
 function warnIfSourceModeSharesDiscoveryRoot(input) {
   if (!input.env.AGENTS_COMM_BUS_BIN) return;
-  if (path4.resolve(input.stateRoot) !== path4.resolve(input.discoveryRoot)) return;
+  if (path6.resolve(input.stateRoot) !== path6.resolve(input.discoveryRoot)) return;
   input.log(
     "agents-comm-bus: source/dev daemon is sharing the production discovery root; set discoveryRoot in .agents-comm-bus-dev.json (for example .agents-comm-bus-discovery/) to let dev and prod daemons coexist."
   );
 }
-function sleep(ms) {
+function sleep2(ms) {
   return new Promise((resolve3) => setTimeout(resolve3, ms));
 }
 
 // ../core-daemon/host-runtime/ensure-central-install.ts
-import path8 from "node:path";
+import path10 from "node:path";
 import { existsSync as existsSync2 } from "node:fs";
-import { readFile as readFile7 } from "node:fs/promises";
+import { readFile as readFile9 } from "node:fs/promises";
 
 // ../core-daemon/host-runtime/run-central-install.ts
-import path7 from "node:path";
+import path9 from "node:path";
 import { existsSync } from "node:fs";
 
 // ../core-daemon/host-runtime/reconcile-central-install.ts
@@ -5584,8 +6797,8 @@ function join3(dir, name) {
 }
 
 // ../core-daemon/host-runtime/node-fs-seam.ts
-import { mkdir as mkdir4, copyFile, writeFile as writeFile2, rename, access, readFile as readFile5, chmod } from "node:fs/promises";
-import path5 from "node:path";
+import { mkdir as mkdir6, copyFile, writeFile as writeFile4, rename as rename3, access, readFile as readFile7, chmod } from "node:fs/promises";
+import path7 from "node:path";
 
 // ../core-daemon/host-runtime/strip-bom.ts
 function stripBom(text) {
@@ -5596,17 +6809,17 @@ function stripBom(text) {
 function createAtomicNodeFsSeam() {
   return {
     mkdirp: async (dir) => {
-      await mkdir4(dir, { recursive: true });
+      await mkdir6(dir, { recursive: true });
     },
     copyFile: async (from, to) => {
       const tmp = `${to}.tmp`;
       await copyFile(from, tmp);
-      await rename(tmp, to);
+      await rename3(tmp, to);
     },
     writeFile: async (file, data) => {
       const tmp = `${file}.tmp`;
-      await writeFile2(tmp, data, "utf8");
-      await rename(tmp, file);
+      await writeFile4(tmp, data, "utf8");
+      await rename3(tmp, file);
     },
     chmod: async (file, mode) => {
       await chmod(file, mode);
@@ -5633,27 +6846,27 @@ async function pathExists(p) {
 }
 async function readJsonOrNull(p) {
   try {
-    return JSON.parse(stripBom(await readFile5(p, "utf8")));
+    return JSON.parse(stripBom(await readFile7(p, "utf8")));
   } catch {
     return null;
   }
 }
 function resolveCentralPaths(stateRoot2, comm) {
-  const bin = path5.join(stateRoot2, "bin");
-  const adapters = path5.join(stateRoot2, "adapters");
+  const bin = path7.join(stateRoot2, "bin");
+  const adapters = path7.join(stateRoot2, "adapters");
   return {
-    daemonBundle: path5.join(bin, "daemon.js"),
-    daemonVersionFile: path5.join(bin, "version.json"),
-    cliBundle: path5.join(bin, "cli.js"),
-    adapterBundle: path5.join(adapters, `${comm}.js`),
-    adapterVersionFile: path5.join(adapters, `${comm}.version.json`)
+    daemonBundle: path7.join(bin, "daemon.js"),
+    daemonVersionFile: path7.join(bin, "version.json"),
+    cliBundle: path7.join(bin, "cli.js"),
+    adapterBundle: path7.join(adapters, `${comm}.js`),
+    adapterVersionFile: path7.join(adapters, `${comm}.version.json`)
   };
 }
 
 // ../core-daemon/host-runtime/install-lock.ts
 import { constants as constants2 } from "node:fs";
-import { open as fsOpen, readFile as readFile6, rm as rm3, mkdir as mkdir5, stat } from "node:fs/promises";
-import path6 from "node:path";
+import { open as fsOpen, readFile as readFile8, rm as rm5, mkdir as mkdir7, stat as stat2 } from "node:fs/promises";
+import path8 from "node:path";
 var DEFAULTS = { timeoutMs: 5e3, retryMs: 50, staleMs: 3e4 };
 var TRANSIENT_WIN32_OPEN_CODES = /* @__PURE__ */ new Set(["EPERM", "EBUSY", "EACCES"]);
 async function acquireInstallLock(lockPath, options = {}) {
@@ -5661,10 +6874,10 @@ async function acquireInstallLock(lockPath, options = {}) {
   const retryMs = options.retryMs ?? DEFAULTS.retryMs;
   const staleMs = options.staleMs ?? DEFAULTS.staleMs;
   const now = options.now ?? Date.now;
-  const sleep2 = options.sleep ?? defaultSleep;
+  const sleep3 = options.sleep ?? defaultSleep;
   const openFn = options.open ?? fsOpen;
   const platform = options.platform ?? process.platform;
-  await mkdir5(path6.dirname(lockPath), { recursive: true });
+  await mkdir7(path8.dirname(lockPath), { recursive: true });
   const token = `${process.pid}:${now()}`;
   const start = now();
   let stoleStale = false;
@@ -5673,7 +6886,7 @@ async function acquireInstallLock(lockPath, options = {}) {
     try {
       handle = await openFn(lockPath, constants2.O_CREAT | constants2.O_EXCL | constants2.O_WRONLY);
     } catch (error) {
-      if (isAlreadyExistsError2(error)) {
+      if (isAlreadyExistsError3(error)) {
         if (await stealIfStale(lockPath, staleMs, now)) {
           stoleStale = true;
           continue;
@@ -5684,7 +6897,7 @@ async function acquireInstallLock(lockPath, options = {}) {
       if (now() - start >= timeoutMs) {
         throw lockTimeoutError(lockPath, timeoutMs, error);
       }
-      await sleep2(retryMs);
+      await sleep3(retryMs);
       continue;
     }
     try {
@@ -5702,9 +6915,9 @@ async function acquireInstallLock(lockPath, options = {}) {
       stoleStale,
       release: async () => {
         try {
-          const current = await readFile6(lockPath, "utf8");
+          const current = await readFile8(lockPath, "utf8");
           if (current.trim() === token) {
-            await rm3(lockPath, { force: true });
+            await rm5(lockPath, { force: true });
           }
         } catch {
         }
@@ -5714,9 +6927,9 @@ async function acquireInstallLock(lockPath, options = {}) {
 }
 async function stealIfStale(lockPath, staleMs, now) {
   try {
-    const info = await stat(lockPath);
+    const info = await stat2(lockPath);
     if (now() - info.mtimeMs > staleMs) {
-      await rm3(lockPath, { force: true });
+      await rm5(lockPath, { force: true });
       return true;
     }
   } catch {
@@ -5726,7 +6939,7 @@ async function stealIfStale(lockPath, staleMs, now) {
 function defaultSleep(ms) {
   return new Promise((resolve3) => setTimeout(resolve3, ms));
 }
-function isAlreadyExistsError2(error) {
+function isAlreadyExistsError3(error) {
   return errorCode(error) === "EEXIST";
 }
 function isTransientOpenError(error, platform) {
@@ -5757,7 +6970,7 @@ function lockTimeoutError(lockPath, timeoutMs, cause) {
 var INSTALL_LOCK_NAME = "install.lock";
 async function runCentralInstall(stateRoot2, actor, deps = {}) {
   const fs = deps.fs ?? createAtomicNodeFsSeam();
-  const lockPath = path7.join(stateRoot2, INSTALL_LOCK_NAME);
+  const lockPath = path9.join(stateRoot2, INSTALL_LOCK_NAME);
   const lock = await acquireInstallLock(lockPath, deps.lock ?? {});
   try {
     const state = await readCentralState(stateRoot2, actor.comm);
@@ -5766,7 +6979,7 @@ async function runCentralInstall(stateRoot2, actor, deps = {}) {
     const paths = resolveCentralPaths(stateRoot2, actor.comm);
     const result = await executeInstallPlan(plan, actor, paths, fs);
     if (plan.daemon.writeBundle && actor.pluginInstallDir) {
-      const cliSrc = path7.join(actor.pluginInstallDir, "cli.bundle.js");
+      const cliSrc = path9.join(actor.pluginInstallDir, "cli.bundle.js");
       if (existsSync(cliSrc)) {
         await installCliLaunchers(paths, cliSrc, fs);
         result.wroteBundles.push(paths.cliBundle);
@@ -5785,9 +6998,9 @@ function resolveInstallMode(env) {
 }
 async function readInstallStamp(pluginInstallDir, deps = {}) {
   if (!pluginInstallDir) return null;
-  const read = deps.readFile ?? readFile7;
+  const read = deps.readFile ?? readFile9;
   try {
-    const raw = await read(path8.join(pluginInstallDir, INSTALL_STAMP_NAME), "utf8");
+    const raw = await read(path10.join(pluginInstallDir, INSTALL_STAMP_NAME), "utf8");
     const parsed = JSON.parse(stripBom(raw));
     if (!parsed || parsed.schema_version !== 1 || typeof parsed.plugin_version !== "string" || typeof parsed.daemon_bundle_version !== "string" || typeof parsed.adapter_bundle_version !== "string" || !isValidAdapterBundleVersionsMap(parsed.adapter_bundle_versions)) {
       return null;
@@ -5805,7 +7018,7 @@ async function ensureCentralInstall(options) {
   }
   const stamp = await readInstallStamp(options.pluginInstallDir, options.deps);
   if (!options.pluginInstallDir || !stamp) {
-    if (options.stateRoot && existsSync2(path8.join(options.stateRoot, "bin", "daemon.js"))) {
+    if (options.stateRoot && existsSync2(path10.join(options.stateRoot, "bin", "daemon.js"))) {
       return { mode: "production", skipped: true };
     }
     throw new Error(
@@ -5891,19 +7104,19 @@ async function centralInstallHasRunnableContent(stateRoot2, comm, deps = {}) {
 }
 
 // ../core-daemon/host-runtime/dev-config-resolver.ts
-import { readFileSync, existsSync as existsSync3 } from "node:fs";
-import path9 from "node:path";
+import { readFileSync as readFileSync2, existsSync as existsSync3 } from "node:fs";
+import path11 from "node:path";
 var DEV_MARKER_NAME = ".agents-comm-bus-dev.json";
 function resolveDevConfig(projectRoot, deps = {}) {
   const exists = deps.exists ?? existsSync3;
-  const readFile11 = deps.readFile ?? ((p) => readFileSync(p, "utf8"));
-  const markerPath = path9.join(projectRoot, DEV_MARKER_NAME);
+  const readFile13 = deps.readFile ?? ((p) => readFileSync2(p, "utf8"));
+  const markerPath = path11.join(projectRoot, DEV_MARKER_NAME);
   if (!exists(markerPath)) {
     return { env: {}, status: "none", reasons: [`no dev marker at ${markerPath}`] };
   }
   let parsed;
   try {
-    parsed = JSON.parse(stripBom(readFile11(markerPath)));
+    parsed = JSON.parse(stripBom(readFile13(markerPath)));
   } catch (error) {
     return {
       env: {},
@@ -5915,7 +7128,7 @@ function resolveDevConfig(projectRoot, deps = {}) {
   if (!daemonBinRaw) {
     return { env: {}, status: "rejected", reasons: ["dev marker missing string field `daemonBin`"] };
   }
-  const daemonBin = path9.resolve(projectRoot, daemonBinRaw);
+  const daemonBin = path11.resolve(projectRoot, daemonBinRaw);
   if (!isInside(projectRoot, daemonBin)) {
     return { env: {}, status: "rejected", reasons: [`dev marker daemonBin escapes project root: ${daemonBinRaw}`] };
   }
@@ -5926,17 +7139,17 @@ function resolveDevConfig(projectRoot, deps = {}) {
   const reasons = [`dev marker applied from ${markerPath}`];
   const record = parsed;
   if (typeof record.stateRoot === "string" && record.stateRoot.length > 0) {
-    const stateRoot2 = path9.resolve(projectRoot, record.stateRoot);
+    const stateRoot2 = path11.resolve(projectRoot, record.stateRoot);
     if (isInside(projectRoot, stateRoot2)) env.AGENTS_COMM_BUS_ROOT = stateRoot2;
     else reasons.push(`ignoring stateRoot outside project root: ${record.stateRoot}`);
   }
   if (typeof record.discoveryRoot === "string" && record.discoveryRoot.length > 0) {
-    const discoveryRoot2 = path9.resolve(projectRoot, record.discoveryRoot);
+    const discoveryRoot2 = path11.resolve(projectRoot, record.discoveryRoot);
     if (isInside(projectRoot, discoveryRoot2)) env.AGENTS_COMM_BUS_DISCOVERY_ROOT = discoveryRoot2;
     else reasons.push(`ignoring discoveryRoot outside project root: ${record.discoveryRoot}`);
   }
   if (typeof record.adaptersDir === "string" && record.adaptersDir.length > 0) {
-    const adaptersDir = path9.resolve(projectRoot, record.adaptersDir);
+    const adaptersDir = path11.resolve(projectRoot, record.adaptersDir);
     if (isInside(projectRoot, adaptersDir)) env.AGENTS_COMM_BUS_ADAPTERS_DIR = adaptersDir;
     else reasons.push(`ignoring adaptersDir outside project root: ${record.adaptersDir}`);
   }
@@ -5947,9 +7160,9 @@ function applyDevConfig(baseEnv, projectRoot, deps = {}) {
   return { env: { ...baseEnv, ...devConfig.env }, devConfig };
 }
 function isInside(root, candidate) {
-  const rel = path9.relative(root, candidate);
+  const rel = path11.relative(root, candidate);
   if (rel === "") return true;
-  return !rel.startsWith("..") && !path9.isAbsolute(rel);
+  return !rel.startsWith("..") && !path11.isAbsolute(rel);
 }
 
 // ../core-daemon/host-runtime/entry-ensures.ts
@@ -5961,10 +7174,10 @@ function resolveEntryContext(fromDir, deps = {}) {
   };
 }
 function findAncestorContaining(dir, name, exists) {
-  let current = path10.resolve(dir);
+  let current = path12.resolve(dir);
   for (; ; ) {
-    if (exists(path10.join(current, name))) return current;
-    const parent = path10.dirname(current);
+    if (exists(path12.join(current, name))) return current;
+    const parent = path12.dirname(current);
     if (parent === current) return void 0;
     current = parent;
   }
@@ -6082,8 +7295,8 @@ function parseProbeResult(result) {
 }
 
 // ../core-daemon/cli/token-file.ts
-import { chmod as chmod2, mkdir as mkdir6, writeFile as writeFile3 } from "node:fs/promises";
-import path11 from "node:path";
+import { chmod as chmod2, mkdir as mkdir8, writeFile as writeFile5 } from "node:fs/promises";
+import path13 from "node:path";
 async function writeCredentialsFile(options) {
   const tokenFile = resolveTokenFilePath({
     stateRoot: options.stateRoot,
@@ -6092,8 +7305,8 @@ async function writeCredentialsFile(options) {
     agent: options.agent,
     accountId: options.accountId
   });
-  await mkdir6(path11.dirname(tokenFile), { recursive: true });
-  await writeFile3(
+  await mkdir8(path13.dirname(tokenFile), { recursive: true });
+  await writeFile5(
     tokenFile,
     `${JSON.stringify(options.credentials, null, 2)}
 `,
@@ -6124,7 +7337,7 @@ async function accountAdd(options) {
     stateRoot: options.stateRoot
   })))(credentials, options.accountId);
   const paths = resolveStatePaths({ stateRoot: options.stateRoot });
-  await mkdir7(paths.root, { recursive: true });
+  await mkdir9(paths.root, { recursive: true });
   const storage = await openSqliteStorage(paths.database);
   try {
     const labelMatches = await storage.listAccountRegistrations({
@@ -6163,6 +7376,7 @@ async function accountAdd(options) {
       bot_user_id: identity.bot_user_id,
       bot_username: identity.bot_username ?? void 0,
       credentials_ref: credentialsRef,
+      activation: "lazy",
       created_at: now,
       updated_at: now,
       metadata: { source: "account-add" }
@@ -6338,7 +7552,7 @@ async function accountRemove(options) {
 }
 
 // ../core-daemon/cli/account-update-token.ts
-import { rm as rm4 } from "node:fs/promises";
+import { rm as rm6 } from "node:fs/promises";
 async function accountUpdateToken(options) {
   const comm = options.comm ?? "telegram";
   const credentials = await resolveCredentialInput({
@@ -6436,15 +7650,65 @@ async function removeOldTokenFile(oldRef, newRef) {
   const oldPath = filePathFromRef(oldRef);
   const newPath = filePathFromRef(newRef);
   if (!oldPath || oldPath === newPath) return;
-  await rm4(oldPath, { force: true });
+  await rm6(oldPath, { force: true });
 }
 async function removeTokenFile(ref) {
   const filePath = filePathFromRef(ref);
   if (!filePath) return;
-  await rm4(filePath, { force: true });
+  await rm6(filePath, { force: true });
 }
 function filePathFromRef(ref) {
   return ref.startsWith("file:") ? ref.slice("file:".length) : null;
+}
+
+// ../core-daemon/cli/account-update-activation.ts
+function parseActivation(value) {
+  if (value === "eager" || value === "lazy") return value;
+  throw new Error("--activation is required and must be eager or lazy");
+}
+async function accountUpdateActivation(options) {
+  const comm = options.comm ?? "telegram";
+  const activation = parseActivation(options.activation);
+  const storage = await openSqliteStorage(resolveStatePaths({ stateRoot: options.stateRoot }).database);
+  try {
+    const current = await resolveCurrentAccount3(storage, {
+      comm,
+      botId: options.botId,
+      accountLabel: options.accountLabel,
+      agent: options.agent,
+      project: options.project
+    });
+    return storage.updateAccountRegistrationActivation({
+      comm,
+      bot_user_id: current.bot_user_id,
+      activation,
+      updated_at: Date.now()
+    });
+  } finally {
+    await storage.close();
+  }
+}
+async function resolveCurrentAccount3(storage, selector) {
+  if (selector.botId) {
+    const row = await storage.getAccountByBot(selector.comm, selector.botId);
+    if (!row) {
+      throw new Error(
+        `no account registration found for (comm=${selector.comm}, bot-id=${selector.botId}); run \`agents-comm account-list\` to inspect registered accounts`
+      );
+    }
+    return row;
+  }
+  if (!selector.accountLabel) {
+    throw new Error(
+      `account-update-activation requires --bot-id or --account-label for ${selector.comm}; run \`agents-comm account-list\` to inspect registered accounts`
+    );
+  }
+  return resolveAccountByLabel(storage, {
+    comm: selector.comm,
+    accountLabel: selector.accountLabel,
+    agent: selector.agent,
+    project: selector.project
+  });
 }
 
 // ../core-daemon/cli/allowlist-shared.ts
@@ -6508,7 +7772,7 @@ async function allowlistAdd(options) {
 }
 
 // ../core-daemon/cli/allowlist-import.ts
-import { readFile as readFile8 } from "node:fs/promises";
+import { readFile as readFile10 } from "node:fs/promises";
 async function allowlistImportFromEnv(options = {}) {
   const comm = options.comm ?? "telegram";
   if (comm !== "telegram") {
@@ -6617,7 +7881,7 @@ function filePathFromCredentialsRef(ref, _project) {
 }
 async function readUserIdsFromJson(filePath) {
   try {
-    const raw = await readFile8(filePath, "utf8");
+    const raw = await readFile10(filePath, "utf8");
     const parsed = JSON.parse(raw);
     return normalizeUserIdField(parsed.userId);
   } catch {
@@ -6702,7 +7966,7 @@ import { pathToFileURL } from "node:url";
 
 // ../core-daemon/migrations/legacy-readers.ts
 import { createHash as createHash2 } from "node:crypto";
-import { existsSync as existsSync5, readdirSync, readFileSync as readFileSync2, statSync } from "node:fs";
+import { existsSync as existsSync5, readdirSync, readFileSync as readFileSync3, statSync } from "node:fs";
 import { basename, join as join4, resolve } from "node:path";
 import { homedir } from "node:os";
 var TRANSITION_ONLY_MARKER = "transition-only";
@@ -6787,10 +8051,10 @@ function discoverLegacySessionRoots(projectRoot, homeDir, skipped3) {
     }
     const expected = legacySessionDirForProject(projectRoot, agent, homeDir);
     for (const entry of entries) {
-      const path13 = join4(parent, entry);
+      const path15 = join4(parent, entry);
       let isDirectory = false;
       try {
-        isDirectory = statSync(path13).isDirectory();
+        isDirectory = statSync(path15).isDirectory();
       } catch {
         continue;
       }
@@ -6798,9 +8062,9 @@ function discoverLegacySessionRoots(projectRoot, homeDir, skipped3) {
       roots.push({
         kind: "session-root",
         agent,
-        path: path13,
+        path: path15,
         projectHint: entry.replace(/-[0-9a-f]{6}$/i, ""),
-        expectedForProject: resolve(path13) === resolve(expected),
+        expectedForProject: resolve(path15) === resolve(expected),
         transition: TRANSITION_ONLY_MARKER,
         cleanupRelease: TRANSITION_CLEANUP_RELEASE
       });
@@ -6808,14 +8072,14 @@ function discoverLegacySessionRoots(projectRoot, homeDir, skipped3) {
   }
   return roots;
 }
-function readLastChat(path13, agent, sessionRoot) {
-  const parsed = readOptionalObject(path13);
+function readLastChat(path15, agent, sessionRoot) {
+  const parsed = readOptionalObject(path15);
   if (!parsed.ok) return parsed;
   const chatId = stringValue(parsed.value.chat_id);
   if (!chatId) return { ok: false, exists: true, reason: "last-chat.json is missing chat_id" };
   return {
     ok: true,
-    file: stateFile("last-chat", agent, path13, sessionRoot, {
+    file: stateFile("last-chat", agent, path15, sessionRoot, {
       chat_id: chatId,
       message_thread_id: nullableString(parsed.value.message_thread_id),
       from_user_id: nullableString(parsed.value.from_user_id),
@@ -6823,8 +8087,8 @@ function readLastChat(path13, agent, sessionRoot) {
     })
   };
 }
-function readPendingPermission(path13, agent, sessionRoot, now, ttlMs) {
-  const parsed = readOptionalObject(path13);
+function readPendingPermission(path15, agent, sessionRoot, now, ttlMs) {
+  const parsed = readOptionalObject(path15);
   if (!parsed.ok) return parsed;
   const timestamp = stringValue(parsed.value.timestamp);
   if (!timestamp) return { ok: false, exists: true, reason: "pending-permission.json is missing timestamp" };
@@ -6833,7 +8097,7 @@ function readPendingPermission(path13, agent, sessionRoot, now, ttlMs) {
   if (now - timestampMs >= ttlMs) return { ok: false, exists: true, reason: "pending permission is expired" };
   return {
     ok: true,
-    file: stateFile("pending-permission", agent, path13, sessionRoot, {
+    file: stateFile("pending-permission", agent, path15, sessionRoot, {
       timestamp,
       tool_name: nullableString(parsed.value.tool_name),
       tool_input: isObject(parsed.value.tool_input) ? parsed.value.tool_input : null,
@@ -6843,8 +8107,8 @@ function readPendingPermission(path13, agent, sessionRoot, now, ttlMs) {
     })
   };
 }
-function readQueue(path13, agent, sessionRoot) {
-  const parsed = readOptionalObject(path13);
+function readQueue(path15, agent, sessionRoot) {
+  const parsed = readOptionalObject(path15);
   if (!parsed.ok) return parsed;
   const rawMessages = Array.isArray(parsed.value.messages) ? parsed.value.messages : [];
   const messages = [];
@@ -6859,18 +8123,18 @@ function readQueue(path13, agent, sessionRoot) {
       imagePath: nullableString(raw.imagePath) ?? void 0
     });
   }
-  return { ok: true, file: stateFile("queue", agent, path13, sessionRoot, messages) };
+  return { ok: true, file: stateFile("queue", agent, path15, sessionRoot, messages) };
 }
-function readOptionalObject(path13) {
-  if (!existsSync5(path13)) return { ok: false, exists: false, reason: "file does not exist" };
-  const parsed = readJson(path13);
+function readOptionalObject(path15) {
+  if (!existsSync5(path15)) return { ok: false, exists: false, reason: "file does not exist" };
+  const parsed = readJson(path15);
   if (!parsed.ok) return { ok: false, exists: true, reason: parsed.reason };
   if (!isObject(parsed.value)) return { ok: false, exists: true, reason: "file is not a JSON object" };
   return { ok: true, value: parsed.value };
 }
-function readJson(path13) {
+function readJson(path15) {
   try {
-    return { ok: true, value: JSON.parse(readFileSync2(path13, "utf8")) };
+    return { ok: true, value: JSON.parse(readFileSync3(path15, "utf8")) };
   } catch (error) {
     return { ok: false, reason: error instanceof Error ? error.message : "invalid JSON" };
   }
@@ -6879,22 +8143,22 @@ function normalizeUserIds(raw) {
   const values = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
   return values.map((value) => stringValue(value).trim()).filter(Boolean);
 }
-function stateFile(kind, agent, path13, sessionRoot, value) {
+function stateFile(kind, agent, path15, sessionRoot, value) {
   return {
     kind,
     agent,
-    path: path13,
+    path: path15,
     sessionRoot,
     value,
     transition: TRANSITION_ONLY_MARKER,
     cleanupRelease: TRANSITION_CLEANUP_RELEASE
   };
 }
-function skip(kind, agent, path13, reason) {
+function skip(kind, agent, path15, reason) {
   return {
     kind,
     agent,
-    path: path13,
+    path: path15,
     reason,
     transition: TRANSITION_ONLY_MARKER,
     cleanupRelease: TRANSITION_CLEANUP_RELEASE
@@ -6952,15 +8216,15 @@ function importLastChat(file, options) {
     }
   };
 }
-function skipped(path13, reason) {
+function skipped(path15, reason) {
   return {
     status: "skipped",
     reason,
-    source_file: path13,
+    source_file: path15,
     audit: {
       kind: "legacy_state_skipped",
       source: "last-chat",
-      path: path13,
+      path: path15,
       reason,
       detail: {},
       transition: TRANSITION_ONLY_MARKER,
@@ -7011,15 +8275,15 @@ function importPendingPermission(file, options) {
     }
   };
 }
-function skipped2(path13, reason) {
+function skipped2(path15, reason) {
   return {
     status: "skipped",
     reason,
-    source_file: path13,
+    source_file: path15,
     audit: {
       kind: "legacy_state_skipped",
       source: "pending-permission",
-      path: path13,
+      path: path15,
       reason,
       detail: {},
       transition: TRANSITION_ONLY_MARKER,
@@ -7190,7 +8454,7 @@ if (invokedIsMigrateEntry && import.meta.url === invokedPath) {
 }
 
 // ../core-daemon/cli/reload-helper.ts
-import { readFile as readFile9 } from "node:fs/promises";
+import { readFile as readFile11 } from "node:fs/promises";
 async function reloadDaemonRegistrations(options = {}) {
   const statePaths = resolveStatePaths({
     stateRoot: process.env.AGENTS_COMM_BUS_ROOT ?? process.env.AGENTS_COMM_BUS_STATE_ROOT
@@ -7212,8 +8476,17 @@ async function reloadDaemonRegistrations(options = {}) {
       timeoutMs,
       metadata: { shimName: "agents-comm-bus/cli" }
     });
-    const params = options.forceCredentialRefresh ? { forceCredentialRefresh: options.forceCredentialRefresh } : void 0;
-    const summary = await connection.request("reload_registrations", params);
+    const params = {};
+    if (options.forceCredentialRefresh) {
+      params.forceCredentialRefresh = options.forceCredentialRefresh;
+    }
+    if (options.ensureRegistrationIds) {
+      params.ensureRegistrationIds = options.ensureRegistrationIds;
+    }
+    const summary = await connection.request(
+      "reload_registrations",
+      Object.keys(params).length > 0 ? params : void 0
+    );
     return { attempted: true, ok: true, summary };
   } catch (error) {
     return {
@@ -7227,7 +8500,7 @@ async function reloadDaemonRegistrations(options = {}) {
 }
 async function readPortFile2(portFile) {
   try {
-    const raw = (await readFile9(portFile, "utf8")).trim();
+    const raw = (await readFile11(portFile, "utf8")).trim();
     const port = Number(raw);
     return Number.isInteger(port) && port > 0 && port < 65536 ? port : void 0;
   } catch {
@@ -7236,9 +8509,9 @@ async function readPortFile2(portFile) {
 }
 
 // ../core-daemon/cli/status.ts
-import { readdir, readFile as readFile10 } from "node:fs/promises";
+import { readdir, readFile as readFile12 } from "node:fs/promises";
 import os2 from "node:os";
-import path12 from "node:path";
+import path14 from "node:path";
 async function daemonStatus(options = {}) {
   const statePaths = resolveStatePaths({
     stateRoot: options.stateRoot ?? process.env.AGENTS_COMM_BUS_STATE_ROOT
@@ -7356,7 +8629,7 @@ function formatDaemonStatus(snapshot) {
 }
 async function readPidFile2(pidFile) {
   try {
-    const raw = (await readFile10(pidFile, "utf8")).trim();
+    const raw = (await readFile12(pidFile, "utf8")).trim();
     const pid = Number(raw);
     return Number.isInteger(pid) && pid > 0 ? pid : void 0;
   } catch {
@@ -7365,7 +8638,7 @@ async function readPidFile2(pidFile) {
 }
 async function readPortFile3(portFile) {
   try {
-    const raw = (await readFile10(portFile, "utf8")).trim();
+    const raw = (await readFile12(portFile, "utf8")).trim();
     const port = Number(raw);
     return Number.isInteger(port) && port > 0 && port < 65536 ? port : void 0;
   } catch {
@@ -7374,7 +8647,7 @@ async function readPortFile3(portFile) {
 }
 async function listCommLeasesForPid(pid) {
   if (pid === void 0) return [];
-  const locksRoot = path12.join(os2.homedir(), ".agents-comm-bus", "comm-locks");
+  const locksRoot = path14.join(os2.homedir(), ".agents-comm-bus", "comm-locks");
   const out = [];
   let commDirs;
   try {
@@ -7383,7 +8656,7 @@ async function listCommLeasesForPid(pid) {
     return out;
   }
   for (const comm of commDirs) {
-    const commDir = path12.join(locksRoot, comm);
+    const commDir = path14.join(locksRoot, comm);
     let files;
     try {
       files = await readdir(commDir);
@@ -7392,9 +8665,9 @@ async function listCommLeasesForPid(pid) {
     }
     for (const file of files) {
       if (!file.endsWith(".json")) continue;
-      const filePath = path12.join(commDir, file);
+      const filePath = path14.join(commDir, file);
       try {
-        const record = JSON.parse(await readFile10(filePath, "utf8"));
+        const record = JSON.parse(await readFile12(filePath, "utf8"));
         if (record.pid !== pid) continue;
         out.push({
           comm: record.comm_id,
@@ -7425,7 +8698,7 @@ async function listRecentConversations(databasePath) {
   }
 }
 async function listWatcherPids(stateRoot2) {
-  const sessionsDir = path12.join(stateRoot2, "claude-wake", "sessions");
+  const sessionsDir = path14.join(stateRoot2, "claude-wake", "sessions");
   const out = [];
   let sessionDirs;
   try {
@@ -7434,9 +8707,9 @@ async function listWatcherPids(stateRoot2) {
     return out;
   }
   for (const sessionKey of sessionDirs) {
-    const pidFile = path12.join(sessionsDir, sessionKey, "watcher.pid");
+    const pidFile = path14.join(sessionsDir, sessionKey, "watcher.pid");
     try {
-      const raw = (await readFile10(pidFile, "utf8")).trim();
+      const raw = (await readFile12(pidFile, "utf8")).trim();
       const pid = Number(raw);
       out.push({
         session_key: sessionKey,
@@ -7453,7 +8726,160 @@ function formatTs(value) {
   return new Date(value).toISOString();
 }
 
+// ../core-daemon/cli/wake-mode.ts
+async function wakeModeSet(options) {
+  const storage = await openSqliteStorage(resolveStatePaths().database);
+  try {
+    const project = options.project && options.project.length > 0 ? normalizeProjectPath(options.project) : "";
+    await storage.setWakeMode(
+      project,
+      options.agent,
+      options.mode,
+      Date.now()
+    );
+    return { ok: true };
+  } finally {
+    await storage.close();
+  }
+}
+async function wakeModeGet(options) {
+  const storage = await openSqliteStorage(resolveStatePaths().database);
+  try {
+    const project = options.project && options.project.length > 0 ? normalizeProjectPath(options.project) : "";
+    const mode = await storage.getWakeMode(project, options.agent);
+    const rows = await storage.listWakeModes();
+    const scoped = rows.find(
+      (row) => row.project === project && row.agent === options.agent
+    );
+    const global = rows.find(
+      (row) => row.project === "" && row.agent === options.agent
+    );
+    const source = scoped ? { scope: "project", project } : global ? { scope: "global", project: "" } : { scope: "default", project: "" };
+    return { ok: true, mode, source };
+  } finally {
+    await storage.close();
+  }
+}
+async function wakeModeClear(options) {
+  const storage = await openSqliteStorage(resolveStatePaths().database);
+  try {
+    const project = options.project && options.project.length > 0 ? normalizeProjectPath(options.project) : "";
+    await storage.clearWakeMode(project, options.agent);
+    return { ok: true };
+  } finally {
+    await storage.close();
+  }
+}
+async function wakeModeList() {
+  const storage = await openSqliteStorage(resolveStatePaths().database);
+  try {
+    const rows = await storage.listWakeModes();
+    return { ok: true, rows };
+  } finally {
+    await storage.close();
+  }
+}
+
+// ../core-daemon/cli/herdr-pane.ts
+async function herdrPaneSync(options) {
+  const identity = parseHerdrIdentity(JSON.parse(options.identityJson));
+  if (!identity) {
+    throw new Error("invalid --identity-json");
+  }
+  const daemon = await entryEnsures({
+    agent: options.agent,
+    fromDir: import.meta.dirname,
+    env: process.env,
+    ensureDaemonOptions: {
+      metadata: { shimName: "agents-comm-bus/cli", operation: "herdr-pane-sync" }
+    }
+  });
+  const connection = await connectIpc({
+    port: daemon.port,
+    clientVersion: DAEMON_VERSION,
+    timeoutMs: 5e3,
+    metadata: { shimName: "agents-comm-bus/cli", operation: "herdr-pane-sync" }
+  });
+  try {
+    return await connection.request("herdr_register_pane", {
+      project: options.project,
+      agent: options.agent,
+      identity,
+      wake_strict: options.wakeStrict
+    });
+  } finally {
+    connection.close();
+  }
+}
+async function herdrPaneRelease(options) {
+  const identity = parseHerdrIdentity(JSON.parse(options.identityJson));
+  if (!identity) {
+    throw new Error("invalid --identity-json");
+  }
+  const daemon = await entryEnsures({
+    agent: identity.agent,
+    fromDir: import.meta.dirname,
+    env: process.env,
+    ensureDaemonOptions: {
+      metadata: { shimName: "agents-comm-bus/cli", operation: "herdr-pane-release" }
+    }
+  });
+  const connection = await connectIpc({
+    port: daemon.port,
+    clientVersion: DAEMON_VERSION,
+    timeoutMs: 5e3,
+    metadata: { shimName: "agents-comm-bus/cli", operation: "herdr-pane-release" }
+  });
+  try {
+    return await connection.request("herdr_release_pane", { identity });
+  } finally {
+    connection.close();
+  }
+}
+
 // ../core-daemon/cli/index.ts
+async function handleWakeModeCommand(rest) {
+  const [sub, ...tail] = rest;
+  const args = parseArgs(tail);
+  switch (sub) {
+    case "set": {
+      const mode = required(args.mode ?? tail.find((a) => !a.startsWith("--")), "mode");
+      if (mode !== "auto" && mode !== "native") {
+        throw new Error("wake-mode set requires mode auto|native");
+      }
+      const out = await wakeModeSet({
+        agent: required(args.agent, "--agent"),
+        project: args.project,
+        mode
+      });
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+    case "get": {
+      const out = await wakeModeGet({
+        agent: required(args.agent, "--agent"),
+        project: args.project
+      });
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+    case "clear": {
+      const out = await wakeModeClear({
+        agent: required(args.agent, "--agent"),
+        project: args.project
+      });
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+    case "list": {
+      const out = await wakeModeList();
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+    default:
+      throw new Error(`unknown wake-mode subcommand: ${sub ?? "(none)"}`);
+  }
+}
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = parseArgs(rest);
@@ -7543,6 +8969,32 @@ async function main() {
       console.log(JSON.stringify({ ...redact(result.next), update: resultSummary(result), reload }, null, 2));
       return;
     }
+    case "account-update-activation": {
+      const result = await accountUpdateActivation({
+        comm: args.comm,
+        botId: args.botId ?? args["bot-id"],
+        accountLabel: args.accountLabel ?? args["account-label"],
+        agent: args.agent,
+        project: args.project,
+        activation: args.activation
+      });
+      const becameEager = result.previous.activation !== "eager" && result.next.activation === "eager";
+      const reload = await reloadDaemonRegistrations(
+        becameEager ? { ensureRegistrationIds: [result.next.registration_id] } : {}
+      );
+      console.log(
+        JSON.stringify(
+          {
+            ...redact(result.next),
+            update: activationSummary(result),
+            reload
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
     case "allowlist": {
       await handleAllowlist(rest);
       return;
@@ -7550,6 +9002,27 @@ async function main() {
     case "migrate": {
       const result = runMigration(parseMigrateArgs(rest));
       console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    case "wake-mode": {
+      await handleWakeModeCommand(rest);
+      return;
+    }
+    case "herdr-pane-sync": {
+      const out = await herdrPaneSync({
+        project: required(args.project, "--project"),
+        agent: required(args.agent, "--agent"),
+        identityJson: required(args.identityJson ?? args["identity-json"], "--identity-json"),
+        wakeStrict: args.wakeStrict ?? args["wake-strict"]
+      });
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+    case "herdr-pane-release": {
+      const out = await herdrPaneRelease({
+        identityJson: required(args.identityJson ?? args["identity-json"], "--identity-json")
+      });
+      console.log(JSON.stringify(out, null, 2));
       return;
     }
     case "status": {
@@ -7670,6 +9143,7 @@ Account commands:
   agents-comm-bus account-remove [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>])
   agents-comm-bus account-relabel [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>]) --new-account-label <label>
   agents-comm-bus account-update-token [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>]) (--bot-token <token> | --credentials-file <path.json> | --credentials-json <json>) [--account-id <id>] [--allow-bot-change]
+  agents-comm-bus account-update-activation [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>]) --activation eager|lazy
 
 Allowlist commands:
   agents-comm-bus allowlist add    --comm <c> --user <id> [--note "..."]                                                      # global
@@ -7701,6 +9175,14 @@ function relabelSummary(result) {
   return {
     previous_account_label: result.previous.account_label,
     account_label: result.next.account_label,
+    bot_user_id: result.next.bot_user_id
+  };
+}
+function activationSummary(result) {
+  return {
+    previous_activation: result.previous.activation,
+    activation: result.next.activation,
+    registration_id: result.next.registration_id,
     bot_user_id: result.next.bot_user_id
   };
 }

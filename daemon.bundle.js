@@ -2237,7 +2237,7 @@ var require_websocket = __commonJS({
     var tls = __require("tls");
     var { randomBytes, createHash: createHash2 } = __require("crypto");
     var { Duplex, Readable: Readable2 } = __require("stream");
-    var { URL } = __require("url");
+    var { URL: URL2 } = __require("url");
     var PerMessageDeflate = require_permessage_deflate();
     var Receiver2 = require_receiver();
     var Sender2 = require_sender();
@@ -2730,11 +2730,11 @@ var require_websocket = __commonJS({
         );
       }
       let parsedUrl;
-      if (address instanceof URL) {
+      if (address instanceof URL2) {
         parsedUrl = address;
       } else {
         try {
-          parsedUrl = new URL(address);
+          parsedUrl = new URL2(address);
         } catch (e) {
           throw new SyntaxError(`Invalid URL: ${address}`);
         }
@@ -2871,7 +2871,7 @@ var require_websocket = __commonJS({
           req.abort();
           let addr;
           try {
-            addr = new URL(location, address);
+            addr = new URL2(location, address);
           } catch (e) {
             const err = new SyntaxError(`Invalid URL: ${location}`);
             emitErrorAndClose(websocket, err);
@@ -3174,7 +3174,7 @@ var require_stream = __commonJS({
       };
       duplex._final = function(callback) {
         if (ws.readyState === ws.CONNECTING) {
-          ws.once("open", function open4() {
+          ws.once("open", function open5() {
             duplex._final(callback);
           });
           return;
@@ -3195,7 +3195,7 @@ var require_stream = __commonJS({
       };
       duplex._write = function(chunk, encoding, callback) {
         if (ws.readyState === ws.CONNECTING) {
-          ws.once("open", function open4() {
+          ws.once("open", function open5() {
             duplex._write(chunk, encoding, callback);
           });
           return;
@@ -3649,17 +3649,84 @@ var require_websocket_server = __commonJS({
 });
 
 // ../core-daemon/serve.ts
-import path7 from "node:path";
+import path11 from "node:path";
 import { pathToFileURL as pathToFileURL2 } from "node:url";
 
 // ../core-daemon/daemon.ts
-import { mkdir as mkdir6 } from "node:fs/promises";
-import os3 from "node:os";
+import { mkdir as mkdir8 } from "node:fs/promises";
+
+// ../packages/core-contracts/dist/types.js
+var SCHEMA_VERSION_QUERY = 1;
+var SCHEMA_VERSION_CONVERSATION = 1;
+var SCHEMA_VERSION_SESSION = 1;
+
+// ../packages/core-contracts/dist/query-semantics.js
+function isExpired(query, now) {
+  return query.created_at + query.ttl_seconds * 1e3 <= now;
+}
+function tryResolve(query, decision, now) {
+  if (query.resolution !== void 0) {
+    return { kind: "rejected", reason: "already_resolved" };
+  }
+  if (isExpired(query, now)) {
+    return { kind: "rejected", reason: "expired" };
+  }
+  if (query.origin_chat !== void 0 && !sameChat(query.origin_chat, decision.decided_in_chat)) {
+    return { kind: "rejected", reason: "wrong_chat" };
+  }
+  return { kind: "accepted" };
+}
+function sameChat(a, b) {
+  return a.comm === b.comm && a.account === b.account && a.chat_native_id === b.chat_native_id && a.thread_native_id === b.thread_native_id;
+}
+
+// ../packages/core-contracts/dist/security.js
+function assertHasOrigin(message) {
+  if (!message.origin || !message.origin.agent && !message.origin.comm) {
+    throw new Error("Message missing origin label");
+  }
+}
+var RecentSeenCache = class {
+  ttlMs;
+  seenMap = /* @__PURE__ */ new Map();
+  constructor(ttlMs = 6e4) {
+    this.ttlMs = ttlMs;
+  }
+  /** True if the key is currently tracked. Also evicts expired entries. */
+  seen(key, now) {
+    this.evict(now);
+    return this.seenMap.has(key);
+  }
+  /** Record a key at time `now`. Also evicts expired entries. */
+  record(key, now) {
+    this.evict(now);
+    this.seenMap.set(key, now);
+  }
+  evict(now) {
+    for (const [id, ts] of this.seenMap) {
+      if (now - ts > this.ttlMs)
+        this.seenMap.delete(id);
+    }
+  }
+};
+var DEFAULT_FOREIGN_BOT_POLICY = {
+  allowForeignBots: false
+};
+function isForeignBotAllowed(sender, policy = DEFAULT_FOREIGN_BOT_POLICY) {
+  if (!sender.isForeignBot)
+    return true;
+  if (policy.allowForeignBots)
+    return true;
+  return policy.allowedBotIds?.includes(sender.id) ?? false;
+}
+
+// ../core-daemon/daemon.ts
+import os4 from "node:os";
 
 // ../core-daemon/config.ts
 var DAEMON_NAME = "agents-comm-bus";
-var DAEMON_VERSION = "0.2.41";
-var IPC_PROTOCOL_VERSION = "1.2.0";
+var DAEMON_VERSION = "0.2.69";
+var IPC_PROTOCOL_VERSION = "1.3.0";
 var IPC_HOST = "127.0.0.1";
 function protocolMajor(version) {
   return version.split(".", 1)[0] ?? version;
@@ -3730,6 +3797,162 @@ import { constants, existsSync, statSync } from "node:fs";
 import { open, mkdir, readFile, rm, stat } from "node:fs/promises";
 import os2 from "node:os";
 import path3 from "node:path";
+
+// ../core-daemon/runtime/process-start-epoch.ts
+import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
+function createProcessStartIdentityCache(probe, now = Date.now, ttlMs = 1e3, selfPid = process.pid) {
+  const values = /* @__PURE__ */ new Map();
+  const pending = /* @__PURE__ */ new Map();
+  let generation = 0;
+  const prefetch = async (pids, refresh = false) => {
+    const ids = [...new Set(pids)].filter((pid) => Number.isInteger(pid) && pid > 0);
+    const pinned = (pid) => pid === selfPid && values.get(pid)?.value != null;
+    const missing = ids.filter((pid) => !pending.has(pid) && !pinned(pid) && (refresh || !values.has(pid) || now() - values.get(pid).at >= ttlMs));
+    if (missing.length) {
+      const epoch = generation;
+      const work = Promise.resolve().then(() => probe(missing)).catch(() => /* @__PURE__ */ new Map()).then((results) => {
+        if (epoch !== generation) return;
+        for (const pid of missing) values.set(pid, { value: results.get(pid) ?? null, at: now() });
+        for (const pid of values.keys()) {
+          if (values.size <= 4096) break;
+          if (pid !== selfPid) values.delete(pid);
+        }
+      }).finally(() => {
+        if (epoch === generation) for (const pid of missing) pending.delete(pid);
+      });
+      for (const pid of missing) pending.set(pid, work);
+    }
+    await Promise.all(ids.map((pid) => pending.get(pid)));
+  };
+  return {
+    read(pid) {
+      if (pending.has(pid)) return null;
+      const entry = values.get(pid);
+      if (entry && (pid === selfPid && entry.value != null || now() - entry.at < ttlMs)) return entry.value;
+      void prefetch([pid]);
+      return null;
+    },
+    prefetch,
+    reset() {
+      generation += 1;
+      values.clear();
+      pending.clear();
+    }
+  };
+}
+function execText(file, args) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      file,
+      args,
+      { encoding: "utf8", windowsHide: true, timeout: 2e3, maxBuffer: 1024 * 1024 },
+      (error, stdout) => error ? reject(error) : resolve(stdout)
+    );
+  });
+}
+async function probeProcessIdentities(pids, platform = process.platform, run = execText) {
+  const result = /* @__PURE__ */ new Map();
+  pids = [...new Set(pids)].filter((pid) => Number.isInteger(pid) && pid > 0);
+  if (!pids.length) return result;
+  if (platform === "win32") {
+    const out = await run("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `Get-Process -Id ${pids.join(",")} -ErrorAction SilentlyContinue | ForEach-Object { try { '{0}:{1}' -f $_.Id,$_.StartTime.ToUniversalTime().Ticks } catch {} }`
+    ]);
+    for (const line of out.trim().split(/\r?\n/)) {
+      const match = /^(\d+):(\d+)$/.exec(line.trim());
+      if (match) result.set(Number(match[1]), Number(BigInt(match[2]) / 10000n - 62135596800000n));
+    }
+  } else if (platform === "darwin") {
+    const out = await run("ps", ["-o", "pid=,lstart=", "-p", pids.join(",")]);
+    for (const line of out.trim().split(/\r?\n/)) {
+      const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+      if (match && Number.isFinite(Date.parse(match[2]))) result.set(Number(match[1]), Date.parse(match[2]));
+    }
+  }
+  return result;
+}
+var identityCache = createProcessStartIdentityCache(probeProcessIdentities);
+async function prefetchProcessStartIdentity(pids) {
+  if (process.platform === "win32" || process.platform === "darwin") {
+    await identityCache.prefetch(pids, true);
+  }
+}
+function readProcessStartIdentity(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    if (options.readProcStat && options.readBootId) {
+      return readLinuxProcessStartIdentity(pid, options);
+    }
+    if (process.platform === "linux") {
+      return readLinuxProcessStartIdentity(pid, options);
+    }
+    if (process.platform === "darwin" || process.platform === "win32") {
+      return identityCache.read(pid);
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+function readProcessStartEpochMs(pid, options = {}) {
+  return readProcessStartIdentity(pid, options);
+}
+function compareProcessStartIdentity(stored, pid, options = {}) {
+  if (stored == null) return "inconclusive";
+  const current = readProcessStartIdentity(pid, options);
+  if (current == null) return "inconclusive";
+  return current === stored ? "match" : "mismatch";
+}
+function fnv1a32(input) {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+function readLinuxBootId(options) {
+  if (options.readBootId) return options.readBootId();
+  try {
+    return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+function readLinuxStartTicks(pid, readProcStat) {
+  const raw = readProcStat?.(pid) ?? (() => {
+    try {
+      return readFileSync(`/proc/${pid}/stat`, "utf8");
+    } catch {
+      return null;
+    }
+  })();
+  if (!raw) return null;
+  const closeParen = raw.lastIndexOf(")");
+  if (closeParen < 0) return null;
+  const fields = raw.slice(closeParen + 2).split(" ");
+  const startTicks = Number(fields[19]);
+  return Number.isFinite(startTicks) ? startTicks : null;
+}
+function readLinuxProcessStartIdentity(pid, options) {
+  const bootId = readLinuxBootId(options);
+  const startTicks = readLinuxStartTicks(pid, options.readProcStat);
+  if (!bootId || startTicks == null) return null;
+  return fnv1a32(`${bootId}:${startTicks}`);
+}
+var currentProcessStart;
+function currentProcessStartEpochMs() {
+  if (currentProcessStart !== void 0) return currentProcessStart;
+  const fromOs = readProcessStartIdentity(process.pid);
+  currentProcessStart = fromOs ?? Date.now() - Math.round(process.uptime() * 1e3);
+  return currentProcessStart;
+}
+
+// ../core-daemon/runtime/comm-lease.ts
 var DEFAULT_STALENESS_MS = 9e4;
 var DEFAULT_IPC_RECENCY_MARGIN_MS = 3e4;
 var AUTHORITY_RANK_ORDER = {
@@ -3803,6 +4026,10 @@ function defaultIsDirectory(p) {
 }
 function decideContention(input) {
   const { self, existing, now, isPidAlive: isPidAlive2, stalenessMs } = input;
+  if (input.eligible === false) {
+    const holder = existing ?? ineligiblePlaceholderHolder(input.commId, input.resourceId);
+    return { take: false, reason: "not-eligible-for-scope", holder };
+  }
   if (!existing) return { take: true, reason: "no-holder" };
   if (!isPidAlive2(existing.pid)) return { take: true, reason: "holder-dead" };
   if (now - existing.renewedAt > stalenessMs) return { take: true, reason: "holder-stale" };
@@ -3818,6 +4045,21 @@ function decideContention(input) {
   }
   return { take: false, reason: "held-by-same-rank-fresh", holder: existing };
 }
+function ineligiblePlaceholderHolder(commId, resourceId) {
+  return {
+    comm_id: commId,
+    resource_id: resourceId,
+    pid: -1,
+    stateRoot: "",
+    checkoutRoot: null,
+    daemonBin: null,
+    daemonVersion: "",
+    authorityRank: "worktree",
+    acquiredAt: 0,
+    renewedAt: 0,
+    lastIpcServedAt: 0
+  };
+}
 var CommLeaseArbiter = class {
   self;
   lastIpcServedAt;
@@ -3827,6 +4069,8 @@ var CommLeaseArbiter = class {
   stalenessMs;
   ipcRecencyMarginMs;
   onAudit;
+  readProcessStartIdentity;
+  testPersistUnderGuard;
   /**
    * Per-resource signature of the last `comm_lease_denied` we actually audited,
    * keyed by `${commId}:${resourceId}` → `${reason}:${holderPid}`. The slow
@@ -3841,6 +4085,8 @@ var CommLeaseArbiter = class {
   lastDenyAudit = /* @__PURE__ */ new Map();
   /** AGE-36: runtime-local inventory of leases this arbiter currently holds. */
   heldLeases = /* @__PURE__ */ new Set();
+  /** Locally desired agent properties keyed by `${commId}:${resourceId}` (AGE-100). */
+  desiredAgentProperties = /* @__PURE__ */ new Map();
   constructor(options) {
     this.self = options.self;
     this.lastIpcServedAt = options.lastIpcServedAt;
@@ -3850,6 +4096,8 @@ var CommLeaseArbiter = class {
     this.stalenessMs = options.stalenessMs ?? DEFAULT_STALENESS_MS;
     this.ipcRecencyMarginMs = options.ipcRecencyMarginMs ?? DEFAULT_IPC_RECENCY_MARGIN_MS;
     this.onAudit = options.onAudit;
+    this.readProcessStartIdentity = options.readProcessStartIdentity ?? readProcessStartIdentity;
+    this.testPersistUnderGuard = options.testPersistUnderGuard;
   }
   get authorityRank() {
     return this.self.authorityRank;
@@ -3869,11 +4117,88 @@ var CommLeaseArbiter = class {
     });
   }
   /**
+   * Record daemon-local desired agent properties for a comm resource. The next
+   * acquire/renew/sync stamps them onto the lease when this arbiter holds it.
+   */
+  setDesiredAgentProperties(commId, resourceId, agentProperties) {
+    this.desiredAgentProperties.set(this.leaseKey(commId, resourceId), agentProperties);
+  }
+  desiredAgentPropertiesFor(commId, resourceId) {
+    return this.desiredAgentProperties.get(this.leaseKey(commId, resourceId));
+  }
+  /**
+   * Re-write `agentProperties` on an already-held lease from the desired map.
+   * No-op when this arbiter does not currently hold the lease.
+   */
+  async syncAgentProperties(commId, resourceId) {
+    const desired = this.desiredAgentProperties.get(this.leaseKey(commId, resourceId));
+    if (!desired) return;
+    await this.persistAgentPropertiesIfHeld(commId, resourceId, desired);
+  }
+  /**
+   * Set desired agent properties and synchronously rewrite the self-held lock
+   * record under the guard. Never self-claims an unheld lock.
+   */
+  async persistAgentPropertiesIfHeld(commId, resourceId, agentProperties) {
+    this.setDesiredAgentProperties(commId, resourceId, agentProperties);
+    const leasePath = this.leasePath(commId, resourceId);
+    const guard = await this.acquireGuard(leasePath);
+    if (!guard) {
+      return { ok: false, reason: "guard-contended" };
+    }
+    try {
+      const existing = await this.readRecord(leasePath);
+      if (!existing || existing.pid !== this.self.pid) {
+        return { ok: false, reason: "not-held" };
+      }
+      const updated = {
+        ...existing,
+        renewedAt: this.now(),
+        lastIpcServedAt: this.lastIpcServedAt(),
+        agentProperties
+      };
+      if (this.testPersistUnderGuard) {
+        await this.testPersistUnderGuard(leasePath);
+      }
+      await this.writeRecord(leasePath, updated);
+      return { ok: true };
+    } finally {
+      await this.releaseGuard(leasePath, guard);
+    }
+  }
+  /**
+   * Read the on-disk comm-resource lease when this arbiter's pid is the holder.
+   * Does not acquire or mutate the lease.
+   */
+  async readHeldCommLease(commId, resourceId) {
+    const key = this.leaseKey(commId, resourceId);
+    if (!this.heldLeases.has(key)) {
+      return { ok: false, reason: "not-held-by-self" };
+    }
+    const leasePath = this.leasePath(commId, resourceId);
+    let exists = false;
+    try {
+      exists = existsSync(leasePath);
+    } catch {
+      return { ok: false, reason: "unreadable" };
+    }
+    if (!exists) return { ok: false, reason: "missing-record" };
+    const existing = await this.readRecord(leasePath);
+    if (!existing) return { ok: false, reason: "unreadable" };
+    if (existing.pid !== this.self.pid) return { ok: false, reason: "not-held-by-self" };
+    return {
+      ok: true,
+      comm_id: commId,
+      resource_id: resourceId,
+      agentProperties: existing.agentProperties
+    };
+  }
+  /**
    * Attempt to acquire (or reclaim) the lease for `(commId, resourceId)`. Reads
    * the existing record under a guard lock, applies {@link decideContention},
    * and writes the self record on a take. Returns a discriminated result.
    */
-  async tryAcquire(commId, resourceId) {
+  async tryAcquire(commId, resourceId, acquireOptions) {
     const leasePath = this.leasePath(commId, resourceId);
     const guard = await this.acquireGuard(leasePath);
     if (!guard) {
@@ -3883,13 +4208,16 @@ var CommLeaseArbiter = class {
     try {
       const existing = await this.readRecord(leasePath);
       const decision = decideContention({
+        commId,
+        resourceId,
         self: this.self,
         selfLastIpcServedAt: this.lastIpcServedAt(),
         existing,
         now: this.now(),
         isPidAlive: this.isPidAlive,
         stalenessMs: this.stalenessMs,
-        ipcRecencyMarginMs: this.ipcRecencyMarginMs
+        ipcRecencyMarginMs: this.ipcRecencyMarginMs,
+        eligible: acquireOptions?.eligible
       });
       if (!decision.take) {
         const denyKey = `${commId}:${resourceId}`;
@@ -3970,7 +4298,9 @@ var CommLeaseArbiter = class {
       const renewed = {
         ...existing,
         renewedAt: this.now(),
-        lastIpcServedAt: this.lastIpcServedAt()
+        lastIpcServedAt: this.lastIpcServedAt(),
+        process_start_time: this.processStartTimeForRecord(existing),
+        agentProperties: this.agentPropertiesForRecord(commId, resourceId, existing)
       };
       await this.writeRecord(leasePath, renewed);
       return { ok: true, record: renewed };
@@ -4019,8 +4349,31 @@ var CommLeaseArbiter = class {
       // Preserve the original acquisition time only if WE already held it.
       acquiredAt: existing && existing.pid === this.self.pid ? existing.acquiredAt : now,
       renewedAt: now,
-      lastIpcServedAt: this.lastIpcServedAt()
+      lastIpcServedAt: this.lastIpcServedAt(),
+      process_start_time: this.processStartTimeForRecord(existing),
+      agentProperties: this.agentPropertiesForRecord(commId, resourceId, existing)
     };
+  }
+  /**
+   * Stamp native process-start identity only when the OS probe succeeds.
+   * Preserves an existing self-held stamp; never writes uptime fallback.
+   */
+  processStartTimeForRecord(existing) {
+    if (existing && existing.pid === this.self.pid && existing.process_start_time != null) {
+      return existing.process_start_time;
+    }
+    const identity = this.readProcessStartIdentity(this.self.pid);
+    return identity ?? void 0;
+  }
+  /**
+   * Stamp agent properties from the locally desired map. A lease reclaimed from
+   * another holder must never inherit the prior holder's properties.
+   */
+  agentPropertiesForRecord(commId, resourceId, existing) {
+    const desired = this.desiredAgentProperties.get(this.leaseKey(commId, resourceId));
+    if (desired) return desired;
+    if (existing && existing.pid === this.self.pid) return existing.agentProperties;
+    return void 0;
   }
   placeholderHolder(commId, resourceId) {
     return {
@@ -4090,7 +4443,9 @@ var CommLeaseArbiter = class {
       const raw = (await readFile(guardPath, "utf8")).trim();
       const pid = Number(raw.split(":")[0]);
       if (!Number.isInteger(pid) || pid <= 0) return true;
-      if (pid === this.self.pid) return true;
+      if (pid === this.self.pid) {
+        return false;
+      }
       return !this.isPidAlive(pid);
     } catch {
       try {
@@ -4132,6 +4487,16 @@ function isAlreadyExistsError(error) {
 }
 var DEFAULT_RENEW_INTERVAL_MS = 1e4;
 var DEFAULT_REACQUIRE_INTERVAL_MS = 6e4;
+var leaseReacquireNudges = /* @__PURE__ */ new Map();
+function leaseResourceKey(commId, resourceId) {
+  return `${commId}:${resourceId}`;
+}
+function nudgeLeaseReacquire(commId, resourceId) {
+  const nudge = leaseReacquireNudges.get(leaseResourceKey(commId, resourceId));
+  if (!nudge) return false;
+  nudge();
+  return true;
+}
 function wrapWithLease(inner, arbiter, options = {}) {
   const renewIntervalMs = options.renewIntervalMs ?? DEFAULT_RENEW_INTERVAL_MS;
   const reacquireIntervalMs = options.reacquireIntervalMs ?? DEFAULT_REACQUIRE_INTERVAL_MS;
@@ -4142,10 +4507,23 @@ function wrapWithLease(inner, arbiter, options = {}) {
   });
   const clearIntervalFn = options.clearIntervalFn ?? ((h) => clearInterval(h));
   const log = options.log ?? ((m) => console.error(m));
+  const leaseEligible = options.leaseEligible;
+  const isLeaseEligible = async () => {
+    if (!leaseEligible) return true;
+    try {
+      return await leaseEligible();
+    } catch {
+      return false;
+    }
+  };
   let renewTimer = null;
   let reacquireTimer = null;
   let innerStarted = false;
   let holdingLease = false;
+  let stopped = false;
+  let reacquireInFlight = false;
+  let pendingReacquire = false;
+  let reacquireTask = null;
   const resource = inner.exclusiveResource?.() ?? null;
   const clearTimers = () => {
     if (renewTimer != null) {
@@ -4158,7 +4536,7 @@ function wrapWithLease(inner, arbiter, options = {}) {
     }
   };
   const startRenewTimer = (resourceId) => {
-    if (renewTimer != null) return;
+    if (stopped || renewTimer != null) return;
     renewTimer = setIntervalFn(() => {
       void arbiter.renew(inner.id, resourceId).then(async (result) => {
         if (result.ok) return;
@@ -4183,36 +4561,106 @@ function wrapWithLease(inner, arbiter, options = {}) {
     }, renewIntervalMs);
   };
   const startReacquireTimer = (resourceId) => {
-    if (reacquireTimer != null) return;
+    if (stopped || reacquireTimer != null) return;
     reacquireTimer = setIntervalFn(() => {
-      void arbiter.tryAcquire(inner.id, resourceId).then(async (result) => {
-        if (!result.ok) return;
-        if (reacquireTimer != null) {
-          clearIntervalFn(reacquireTimer);
-          reacquireTimer = null;
-        }
-        holdingLease = true;
-        log(
-          `comm ${inner.id} resource ${resourceId}: acquired the poll lease on re-acquire; starting this consumer.`
-        );
-        try {
-          await inner.start();
-          innerStarted = true;
-          startRenewTimer(resourceId);
-        } catch (error) {
-          innerStarted = false;
-          holdingLease = false;
-          log(
-            `comm ${inner.id} resource ${resourceId}: inner.start() failed after re-acquire: ${error instanceof Error ? error.message : String(error)}; releasing lease.`
-          );
-          await arbiter.release(inner.id, resourceId).catch(() => {
-          });
-          startReacquireTimer(resourceId);
-        }
-      }).catch(() => {
-      });
+      scheduleReacquireAttempt(resourceId);
     }, reacquireIntervalMs);
   };
+  const trackReacquireTask = (task) => {
+    reacquireTask = task;
+    void task.finally(() => {
+      if (reacquireTask === task) reacquireTask = null;
+    });
+  };
+  const scheduleReacquireAttempt = (resourceId) => {
+    if (stopped || holdingLease || innerStarted) return;
+    if (reacquireInFlight) {
+      pendingReacquire = true;
+      return;
+    }
+    trackReacquireTask(runReacquireAttempt(resourceId));
+  };
+  const runReacquireAttempt = async (resourceId) => {
+    if (stopped || holdingLease || innerStarted) return;
+    if (reacquireInFlight) {
+      pendingReacquire = true;
+      return;
+    }
+    reacquireInFlight = true;
+    try {
+      const eligible = await isLeaseEligible();
+      if (stopped) return;
+      const result = await arbiter.tryAcquire(inner.id, resourceId, { eligible });
+      if (stopped) {
+        if (result.ok) await arbiter.release(inner.id, resourceId).catch(() => {
+        });
+        return;
+      }
+      if (!result.ok) {
+        startReacquireTimer(resourceId);
+        return;
+      }
+      if (reacquireTimer != null) {
+        clearIntervalFn(reacquireTimer);
+        reacquireTimer = null;
+      }
+      holdingLease = true;
+      if (stopped) {
+        holdingLease = false;
+        await arbiter.release(inner.id, resourceId).catch(() => {
+        });
+        return;
+      }
+      log(
+        `comm ${inner.id} resource ${resourceId}: acquired the poll lease on re-acquire; starting this consumer.`
+      );
+      try {
+        await inner.start();
+        if (stopped) {
+          innerStarted = false;
+          holdingLease = false;
+          await inner.stop().catch(() => {
+          });
+          await arbiter.release(inner.id, resourceId).catch(() => {
+          });
+          return;
+        }
+        innerStarted = true;
+        startRenewTimer(resourceId);
+      } catch (error) {
+        innerStarted = false;
+        holdingLease = false;
+        log(
+          `comm ${inner.id} resource ${resourceId}: inner.start() failed after re-acquire: ${error instanceof Error ? error.message : String(error)}; releasing lease.`
+        );
+        await arbiter.release(inner.id, resourceId).catch(() => {
+        });
+        if (!stopped) startReacquireTimer(resourceId);
+      }
+    } catch {
+      if (!stopped) startReacquireTimer(resourceId);
+    } finally {
+      reacquireInFlight = false;
+      if (!stopped && pendingReacquire && !holdingLease && !innerStarted) {
+        pendingReacquire = false;
+        scheduleReacquireAttempt(resourceId);
+      } else {
+        pendingReacquire = false;
+      }
+    }
+  };
+  const nudgeReacquire = () => {
+    if (stopped || !resource) return;
+    if (holdingLease || innerStarted) return;
+    if (reacquireTimer != null) {
+      clearIntervalFn(reacquireTimer);
+      reacquireTimer = null;
+    }
+    scheduleReacquireAttempt(resource.resourceId);
+  };
+  if (resource) {
+    leaseReacquireNudges.set(leaseResourceKey(inner.id, resource.resourceId), nudgeReacquire);
+  }
   const proxy = {
     get id() {
       return inner.id;
@@ -4231,7 +4679,8 @@ function wrapWithLease(inner, arbiter, options = {}) {
         innerStarted = true;
         return;
       }
-      const result = await arbiter.tryAcquire(inner.id, resource.resourceId);
+      const eligible = await isLeaseEligible();
+      const result = await arbiter.tryAcquire(inner.id, resource.resourceId, { eligible });
       if (!result.ok) {
         holdingLease = false;
         log(
@@ -4256,7 +4705,15 @@ function wrapWithLease(inner, arbiter, options = {}) {
       }
     },
     async stop() {
+      stopped = true;
       clearTimers();
+      if (resource) {
+        leaseReacquireNudges.delete(leaseResourceKey(inner.id, resource.resourceId));
+      }
+      if (reacquireTask) {
+        await reacquireTask.catch(() => {
+        });
+      }
       try {
         if (innerStarted) await inner.stop();
       } finally {
@@ -4288,6 +4745,324 @@ function wrapWithLease(inner, arbiter, options = {}) {
     editMessage: inner.editMessage ? (chatNativeId, messageNativeId, text, opts) => inner.editMessage(chatNativeId, messageNativeId, text, opts) : void 0
   };
   return proxy;
+}
+
+// ../core-daemon/runtime/session-owner-liveness.ts
+var DEFAULT_SESSION_OWNER_RECENCY_MS = 24 * 60 * 60 * 1e3;
+function defaultIsPidAlive2(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function classifySessionOwnerProcess(session, options = {}) {
+  const pid = session.lease_owner_process_pid;
+  const registeredAt = session.lease_owner_process_registered_at;
+  const startTime = session.lease_owner_process_start_time;
+  if (pid == null || registeredAt == null) return "no_owner";
+  const isPidAlive2 = options.isPidAlive ?? defaultIsPidAlive2;
+  if (!isPidAlive2(pid)) return "dead";
+  if (startTime != null) {
+    const identityOptions = {
+      readProcStat: options.readProcStat,
+      readBootId: options.readBootId,
+      readProcUptime: options.readProcUptime,
+      readClockTicksPerSec: options.readClockTicksPerSec
+    };
+    const compare = options.readProcessStartEpochMs ? (() => {
+      const current = options.readProcessStartEpochMs(pid);
+      if (current == null) return "inconclusive";
+      return current === startTime ? "match" : "mismatch";
+    })() : compareProcessStartIdentity(startTime, pid, identityOptions);
+    if (compare === "mismatch") return "dead";
+    if (compare === "match") return "live";
+  }
+  const now = options.now ?? Date.now;
+  const recencyMs = options.recencyMs ?? DEFAULT_SESSION_OWNER_RECENCY_MS;
+  if (now() - registeredAt > recencyMs) return "stale";
+  return "live";
+}
+function createSessionOwnerLiveness(options = {}) {
+  return (session) => session.lease_holder_connection_id != null || classifySessionOwnerProcess(session, options) === "live";
+}
+
+// ../core-daemon/runtime/session-deliverability.ts
+function isSessionLocallyDeliverable(session, hasDaemonLocalWakeRoute, sessionOwnerIsLive) {
+  return hasDaemonLocalWakeRoute && sessionOwnerIsLive(session);
+}
+
+// ../core-daemon/session-label-scope.ts
+function parseAgentsCommLabels(raw) {
+  if (raw === void 0 || raw === null) return null;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return null;
+  const map = {};
+  for (const entry of trimmed.split(",")) {
+    const piece = entry.trim();
+    if (piece.length === 0) {
+      throw new Error(`AGENTS_COMM_LABELS contains an empty entry in "${raw}"`);
+    }
+    const colon = piece.indexOf(":");
+    if (colon <= 0 || colon === piece.length - 1) {
+      throw new Error(
+        `AGENTS_COMM_LABELS entry "${piece}" is malformed; expected comm:label`
+      );
+    }
+    const comm = piece.slice(0, colon).trim();
+    const label = piece.slice(colon + 1).trim();
+    if (comm.length === 0 || label.length === 0) {
+      throw new Error(
+        `AGENTS_COMM_LABELS entry "${piece}" is malformed; expected comm:label`
+      );
+    }
+    if (map[comm] !== void 0) {
+      throw new Error(`AGENTS_COMM_LABELS lists comm "${comm}" more than once`);
+    }
+    map[comm] = label;
+  }
+  return map;
+}
+function serializeAccountLabelScope(scope) {
+  if (!scope || Object.keys(scope).length === 0) return null;
+  const sorted = Object.keys(scope).sort();
+  const canonical = {};
+  for (const comm of sorted) {
+    canonical[comm] = scope[comm];
+  }
+  return JSON.stringify(canonical);
+}
+function parseAccountLabelScope(stored) {
+  if (stored === void 0 || stored === null) return null;
+  const trimmed = stored.trim();
+  if (trimmed.length === 0) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error(`account_label_scope is not valid JSON: ${stored}`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`account_label_scope must be a JSON object: ${stored}`);
+  }
+  const map = {};
+  for (const [comm, label] of Object.entries(parsed)) {
+    if (typeof label !== "string" || label.length === 0) {
+      throw new Error(`account_label_scope value for "${comm}" must be a non-empty string`);
+    }
+    map[comm] = label;
+  }
+  return map;
+}
+function accountLabelScopeFromParams(params) {
+  if (params.account_label_scope === null) return null;
+  if (typeof params.account_label_scope === "string") {
+    return serializeAccountLabelScope(parseAccountLabelScope(params.account_label_scope));
+  }
+  if (typeof params.comm_labels === "string") {
+    return serializeAccountLabelScope(parseAgentsCommLabels(params.comm_labels));
+  }
+  return null;
+}
+function filterRegistrationsByScope(registrations, scopeStored) {
+  const scope = parseRoutingScope(scopeStored);
+  if (scope === void 0) return [];
+  if (!scope) return [...registrations];
+  return registrations.filter((reg) => {
+    const expected = scope[reg.comm];
+    return expected !== void 0 && reg.account_label === expected;
+  });
+}
+function liveSessionScopeCandidates(target, sessions, isSessionLive) {
+  const liveSiblings = sessions.filter(
+    (session) => session.session_id !== target.session_id && session.project === target.project && session.agent === target.agent && session.status === "active" && isSessionLive(session)
+  );
+  return [target, ...liveSiblings];
+}
+function filterRegistrationsForSession(registrations, target, sessions, isSessionLive = hasLiveConnectionLease) {
+  if (target.account_label_scope != null) {
+    return filterRegistrationsByScope(
+      registrations,
+      target.account_label_scope
+    );
+  }
+  const labeledSiblings = liveSessionScopeCandidates(
+    target,
+    sessions,
+    isSessionLive
+  ).filter(
+    (session) => session.session_id !== target.session_id && session.account_label_scope != null
+  );
+  if (labeledSiblings.length === 0) return [...registrations];
+  return registrations.filter(
+    (registration) => !labeledSiblings.some(
+      (session) => registrationMatchesConversationScope(
+        session.account_label_scope,
+        registration
+      )
+    )
+  );
+}
+function sessionOwnsConversation(target, sessions, conversation, isSessionLive = hasLiveConnectionLease) {
+  if (conversation.project !== target.project || conversation.agent !== target.agent) {
+    return false;
+  }
+  const resolved = resolveSessionForConversation(
+    liveSessionScopeCandidates(target, sessions, isSessionLive),
+    conversation,
+    (session) => session.session_id
+  );
+  return resolved?.session_id === target.session_id;
+}
+function registrationMatchesConversationScope(scopeStored, conversation) {
+  const scope = parseRoutingScope(scopeStored);
+  if (scope === void 0) return false;
+  if (!scope) return true;
+  const expected = scope[conversation.comm];
+  return expected !== void 0 && expected === conversation.account_label;
+}
+function resolveSessionForConversation(sessions, conversation, pickSessionId) {
+  const labeledMatches = sessions.filter(
+    (sess) => sess.account_label_scope != null && registrationMatchesConversationScope(sess.account_label_scope, conversation)
+  );
+  if (labeledMatches.length > 0) {
+    return labeledMatches[0];
+  }
+  const unlabeled = sessions.filter((sess) => sess.account_label_scope == null);
+  if (unlabeled.length === 1) {
+    return unlabeled[0];
+  }
+  if (unlabeled.length > 1) {
+    return void 0;
+  }
+  return void 0;
+}
+function hasLiveConnectionLease(session) {
+  return session.lease_holder_connection_id != null;
+}
+function parseRoutingScope(stored) {
+  try {
+    return parseAccountLabelScope(stored ?? null);
+  } catch (error) {
+    console.error(
+      `agents-comm-bus: invalid persisted account_label_scope; treating session as scope-inert: ${error instanceof Error ? error.message : String(error)}`
+    );
+    return void 0;
+  }
+}
+
+// ../core-daemon/runtime/inspect-inbound-target.ts
+function resolveSessionForConversationDetailed(sessions, conversation, sessionOwnerIsLive) {
+  const live = sessions.filter((sess) => sessionOwnerIsLive(sess));
+  const labeled = live.filter(
+    (sess) => sess.account_label_scope != null && registrationMatchesConversationScope(sess.account_label_scope, conversation)
+  );
+  if (labeled.length === 1) {
+    return { resolution: "resolved", session: labeled[0], candidates: [] };
+  }
+  if (labeled.length > 1) {
+    return { resolution: "ambiguous", candidates: labeled };
+  }
+  const unlabeled = live.filter((sess) => sess.account_label_scope == null);
+  if (unlabeled.length === 1) {
+    return { resolution: "resolved", session: unlabeled[0], candidates: [] };
+  }
+  if (unlabeled.length > 1) {
+    return { resolution: "ambiguous", candidates: unlabeled };
+  }
+  return { resolution: "cold", candidates: [] };
+}
+function normalizeDaemonRoot(value) {
+  return value ? normalizeDaemonRootPath(value) : "";
+}
+async function handleInspectInboundTarget(params, deps) {
+  const target = await resolveTarget(params, deps.storage);
+  if (!target) {
+    return { resolution: "not_found", locally_deliverable: false };
+  }
+  const registration = target;
+  const sessions = await deps.storage.listSessions({
+    project: target.project,
+    agent: target.agent,
+    status: "active"
+  });
+  const detailed = resolveSessionForConversationDetailed(
+    sessions,
+    { comm: target.comm, account_label: target.account_label },
+    deps.sessionOwnerIsLive
+  );
+  if (detailed.resolution !== "resolved" || !detailed.session) {
+    return {
+      resolution: detailed.resolution,
+      registration,
+      routed_session: null,
+      locally_deliverable: false,
+      // Diagnostic only, and only for `ambiguous`. A caller that branches on
+      // these is doing routing, and routing is daemon-owned.
+      ...detailed.resolution === "ambiguous" ? {
+        // Diagnostic only, and ONLY for ambiguous. A caller that branches
+        // on candidates is doing routing, and routing is daemon-owned.
+        candidate_sessions: detailed.candidates.map((c) => ({
+          session_id: c.session_id,
+          account_label_scope: c.account_label_scope
+        }))
+      } : {}
+    };
+  }
+  const session = detailed.session;
+  const bridge = deps.bridges.find((b) => b.agentId === target.agent);
+  const ownerDaemonMatches = normalizeDaemonRoot(session.lease_owner_daemon_discovery_root) === normalizeDaemonRoot(deps.daemonOwner.discoveryRoot);
+  const routeReady = ownerDaemonMatches && bridge?.routeReady !== void 0 ? bridge.routeReady(session.session_id) : false;
+  return {
+    resolution: "resolved",
+    registration,
+    routed_session: {
+      session_id: session.session_id,
+      account_label_scope: session.account_label_scope,
+      owner_pid: session.lease_owner_process_pid ?? null,
+      owner_registered_at: session.lease_owner_process_registered_at ?? null,
+      // Process-owner classification ONLY — diagnostics. Not the verdict:
+      // the canonical predicate is an OR with the connection lease, so a live
+      // connection with no PID is `no_owner` here and still deliverable.
+      owner_state: classifySessionOwnerProcess(session),
+      owner_daemon_matches: ownerDaemonMatches,
+      route_ready: routeReady
+    },
+    locally_deliverable: isSessionLocallyDeliverable(
+      session,
+      routeReady,
+      deps.sessionOwnerIsLive
+    )
+  };
+}
+async function resolveTarget(params, storage) {
+  const conversationId = params.conversation_id;
+  if (typeof conversationId === "string" && conversationId.length > 0) {
+    const conv = await storage.getConversation(conversationId);
+    if (!conv) return void 0;
+    return {
+      project: conv.project,
+      agent: conv.agent,
+      comm: conv.comm,
+      // Legacy rows may predate bot-id backfill; report the empty string rather
+      // than null so the target shape stays uniform across both lookups.
+      account: conv.bot_user_id ?? "",
+      account_label: conv.account_label
+    };
+  }
+  const comm = params.comm;
+  const account = params.account;
+  if (typeof comm !== "string" || typeof account !== "string") return void 0;
+  const reg = await storage.getAccountByBot(comm, account);
+  if (!reg) return void 0;
+  return {
+    project: reg.project,
+    agent: reg.agent,
+    comm: reg.comm,
+    account: reg.bot_user_id,
+    account_label: reg.account_label
+  };
 }
 
 // ../node_modules/ws/wrapper.mjs
@@ -4478,17 +5253,16 @@ async function handleRequest(socket, data, onRequest) {
   }
 }
 
-// ../core-daemon/bootstrap/ensure-daemon.ts
-import { mkdir as mkdir3, readFile as readFile2, rm as rm2, writeFile } from "node:fs/promises";
-
 // ../core-daemon/storage/audit.ts
+import { createReadStream } from "node:fs";
 import { mkdir as mkdir2 } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline/promises";
 
 // ../core-daemon/storage/jsonl.ts
 import { open as open2 } from "node:fs/promises";
-async function appendJsonLine(path8, value) {
-  const handle = await open2(path8, "a");
+async function appendJsonLine(path12, value) {
+  const handle = await open2(path12, "a");
   try {
     await handle.writeFile(`${JSON.stringify(value)}
 `, "utf8");
@@ -4508,12 +5282,31 @@ var JsonlAuditStore = class {
   }
   root;
   async append(event) {
-    const path8 = this.pathFor(event.timestamp);
-    await mkdir2(dirname(path8), { recursive: true });
-    await appendJsonLine(path8, event);
+    const path12 = this.pathFor(event.timestamp);
+    await mkdir2(dirname(path12), { recursive: true });
+    await appendJsonLine(path12, event);
   }
   pathFor(timestamp) {
     return join(this.root, "audit", `${utcDay(timestamp)}.jsonl`);
+  }
+  async hasInboundReceived(conversation_id, message, auditTimestamp) {
+    const path12 = this.pathFor(auditTimestamp ?? Date.now());
+    try {
+      const lines = createInterface({
+        input: createReadStream(path12, { encoding: "utf8" }),
+        crlfDelay: Infinity
+      });
+      for await (const line of lines) {
+        if (line.trim() === "") continue;
+        const event = JSON.parse(line);
+        if (event.kind === "inbound_received" && event.conversation_id === conversation_id && event.detail?.platform_message_id === message.platform_message_id) {
+          return true;
+        }
+      }
+    } catch {
+      return false;
+    }
+    return false;
   }
 };
 
@@ -4652,78 +5445,663 @@ async function probeDaemon(options) {
   return connection.hello;
 }
 
-// ../core-daemon/bootstrap/ensure-daemon.ts
+// ../core-daemon/bootstrap/discovery-claim.ts
+import { randomUUID as randomUUID2 } from "node:crypto";
+import { mkdir as mkdir4, readFile as readFile3, rename as rename2, rm as rm3, writeFile as writeFile2, link as link2 } from "node:fs/promises";
+import path5 from "node:path";
+
+// ../core-daemon/bootstrap/discovery-guard.ts
+import { randomUUID } from "node:crypto";
+import { mkdir as mkdir3, readFile as readFile2, rename, rm as rm2, stat as stat2, writeFile, link } from "node:fs/promises";
+import path4 from "node:path";
+var GUARD_FILE = "owner.lock";
+var RECLAIM_FILE = "owner.lock.reclaim";
+var RECLAIM2_FILE = "owner.lock.reclaim2";
+var RETRY_MS = 20;
+var DEFAULT_MAX_WAIT_MS = 2e3;
+var loggedDeadReclaim2Paths = /* @__PURE__ */ new Set();
+function discoveryGuardFile(discoveryRoot2) {
+  return path4.join(discoveryRoot2, GUARD_FILE);
+}
+function discoveryReclaimLockFile(discoveryRoot2) {
+  return path4.join(discoveryRoot2, RECLAIM_FILE);
+}
+function discoveryReclaim2LockFile(discoveryRoot2) {
+  return path4.join(discoveryRoot2, RECLAIM2_FILE);
+}
+function parseDiscoveryGuardToken(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed) return void 0;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (typeof parsed.pid !== "number" || !Number.isInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.at !== "number" || !Number.isFinite(parsed.at)) {
+      return void 0;
+    }
+    const startedAt = parsed.startedAt === null || parsed.startedAt === void 0 ? null : typeof parsed.startedAt === "number" && Number.isFinite(parsed.startedAt) ? parsed.startedAt : void 0;
+    if (startedAt === void 0 && parsed.startedAt !== null && parsed.startedAt !== void 0) {
+      return void 0;
+    }
+    const nonce = typeof parsed.nonce === "string" ? parsed.nonce : "";
+    return { pid: parsed.pid, startedAt: startedAt ?? null, at: parsed.at, nonce };
+  } catch {
+    return void 0;
+  }
+}
+function guardTokensEqual(a, b) {
+  return a.pid === b.pid && a.startedAt === b.startedAt && a.at === b.at && a.nonce === b.nonce;
+}
+async function withDiscoveryGuard(discoveryRoot2, self, fn, options = {}) {
+  await mkdir3(discoveryRoot2, { recursive: true });
+  const isPidAlive2 = options.isPidAlive ?? defaultIsPidAlive3;
+  const deadline = Date.now() + (options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS);
+  let acquiredToken;
+  while (Date.now() <= deadline) {
+    const attempt = await tryAcquireGuard(discoveryRoot2, self, isPidAlive2, options);
+    if (attempt.kind === "acquired") {
+      acquiredToken = attempt.token;
+      try {
+        return { ok: true, value: await fn() };
+      } finally {
+        await releaseGuardIfTokenMatches(discoveryGuardFile(discoveryRoot2), acquiredToken);
+      }
+    }
+    if (attempt.kind === "contended") {
+      await sleep(RETRY_MS);
+      continue;
+    }
+    return { ok: false, reason: "guard_contended" };
+  }
+  return { ok: false, reason: "guard_contended" };
+}
+async function tryAcquireGuard(discoveryRoot2, self, isPidAlive2, options) {
+  const reclaim2Raw = await readGuardRaw(discoveryReclaim2LockFile(discoveryRoot2));
+  if (reclaim2Raw !== null) {
+    const reclaim2 = parseDiscoveryGuardToken(reclaim2Raw);
+    if (reclaim2 && !isPidAlive2(reclaim2.pid)) {
+      logDeadReclaim2Once(discoveryReclaim2LockFile(discoveryRoot2));
+    }
+    return { kind: "failed" };
+  }
+  const guardPath = discoveryGuardFile(discoveryRoot2);
+  const token = buildGuardToken(self, options.now);
+  const published = await publishFileViaLink(guardPath, token, self.pid, options);
+  if (published === "ok") {
+    return { kind: "acquired", token };
+  }
+  const raw = await readGuardRaw(guardPath);
+  if (raw === null) {
+    return { kind: "contended" };
+  }
+  const existing = parseDiscoveryGuardToken(raw);
+  if (!existing) {
+    return { kind: "contended" };
+  }
+  if (existing.pid === self.pid) {
+    return { kind: "contended" };
+  }
+  if (isPidAlive2(existing.pid)) {
+    return { kind: "contended" };
+  }
+  await options.beforeReclaim?.();
+  const reclaimed = await reclaimDeadGuard(discoveryRoot2, self, existing, isPidAlive2, options);
+  return reclaimed ? { kind: "contended" } : { kind: "failed" };
+}
+async function reclaimDeadGuard(discoveryRoot2, self, deadToken, isPidAlive2, options) {
+  const reclaimHeld = await tryAcquireReclaimLock(discoveryRoot2, self, isPidAlive2, options);
+  if (!reclaimHeld) return false;
+  try {
+    await options.beforeQuarantine?.();
+    return await quarantineVerifiedGuard(discoveryRoot2, self, deadToken, options);
+  } finally {
+    await releaseGuardIfTokenMatches(discoveryReclaimLockFile(discoveryRoot2), reclaimHeld);
+  }
+}
+async function tryAcquireReclaimLock(discoveryRoot2, self, isPidAlive2, options) {
+  const reclaimPath = discoveryReclaimLockFile(discoveryRoot2);
+  const reclaimToken = buildGuardToken({ pid: self.pid, startedAt: self.startedAt }, options.now);
+  if (await publishFileViaLink(reclaimPath, reclaimToken, self.pid, options) === "ok") {
+    return reclaimToken;
+  }
+  const raw = await readGuardRaw(reclaimPath);
+  if (!raw) return void 0;
+  const existing = parseDiscoveryGuardToken(raw);
+  if (!existing) return void 0;
+  if (isPidAlive2(existing.pid)) return void 0;
+  await options.beforeReclaim2?.();
+  const recovered = await recoverDeadReclaimLockUnderReclaim2(
+    discoveryRoot2,
+    self,
+    existing,
+    isPidAlive2,
+    options
+  );
+  if (!recovered) return void 0;
+  const retryToken = buildGuardToken({ pid: self.pid, startedAt: self.startedAt }, options.now);
+  if (await publishFileViaLink(reclaimPath, retryToken, self.pid, options) === "ok") {
+    return retryToken;
+  }
+  return void 0;
+}
+async function recoverDeadReclaimLockUnderReclaim2(discoveryRoot2, self, expectedDeadToken, isPidAlive2, options) {
+  const reclaim2Path = discoveryReclaim2LockFile(discoveryRoot2);
+  const reclaim2Raw = await readGuardRaw(reclaim2Path);
+  if (reclaim2Raw !== null) {
+    const reclaim2 = parseDiscoveryGuardToken(reclaim2Raw);
+    if (reclaim2 && !isPidAlive2(reclaim2.pid)) {
+      logDeadReclaim2Once(reclaim2Path);
+    }
+    return false;
+  }
+  const reclaim2Token = buildGuardToken({ pid: self.pid, startedAt: self.startedAt }, options.now);
+  if (await publishFileViaLink(reclaim2Path, reclaim2Token, self.pid, options) !== "ok") {
+    return false;
+  }
+  const reclaimPath = discoveryReclaimLockFile(discoveryRoot2);
+  try {
+    const reread = await readGuardRaw(reclaimPath);
+    const current = reread ? parseDiscoveryGuardToken(reread) : void 0;
+    if (!current || !guardTokensEqual(current, expectedDeadToken)) {
+      return false;
+    }
+    return await quarantineVerifiedGuardFile(reclaimPath, self, expectedDeadToken, options.now);
+  } finally {
+    await releaseGuardIfTokenMatches(reclaim2Path, reclaim2Token);
+  }
+}
+function logDeadReclaim2Once(reclaim2Path) {
+  if (loggedDeadReclaim2Paths.has(reclaim2Path)) return;
+  loggedDeadReclaim2Paths.add(reclaim2Path);
+  console.error(`dead discovery reclaim2 token at ${reclaim2Path}; manual cleanup required`);
+}
+async function quarantineVerifiedGuard(discoveryRoot2, self, expectedDeadToken, options) {
+  return quarantineVerifiedGuardFile(
+    discoveryGuardFile(discoveryRoot2),
+    self,
+    expectedDeadToken,
+    options.now
+  );
+}
+async function quarantineVerifiedGuardFile(guardPath, self, expectedDeadToken, now) {
+  const raw = await readGuardRaw(guardPath);
+  if (!raw) return false;
+  const current = parseDiscoveryGuardToken(raw);
+  if (!current || !guardTokensEqual(current, expectedDeadToken)) {
+    return false;
+  }
+  const clock = now ?? Date.now;
+  const stalePath = `${guardPath}.stale.${self.pid}.${clock()}`;
+  try {
+    await rename(guardPath, stalePath);
+  } catch {
+    return false;
+  }
+  await rm2(stalePath, { force: true });
+  return true;
+}
+async function publishFileViaLink(targetPath, content, selfPid, options = {}) {
+  const clock = options.now ?? Date.now;
+  const tempPath = `${targetPath}.tmp.${selfPid}.${clock()}.${randomUUID()}`;
+  try {
+    await writeFile(tempPath, content, { encoding: "utf8", flag: "wx" });
+    await options.beforeGuardLink?.();
+    try {
+      await link(tempPath, targetPath);
+      return "ok";
+    } catch (error) {
+      if (isAlreadyExistsError2(error)) return "eexist";
+      throw error;
+    }
+  } finally {
+    await rm2(tempPath, { force: true });
+  }
+}
+function buildGuardToken(self, now) {
+  const clock = now ?? Date.now;
+  const token = {
+    pid: self.pid,
+    startedAt: self.startedAt,
+    at: clock(),
+    nonce: randomUUID()
+  };
+  return `${JSON.stringify(token)}
+`;
+}
+async function readGuardRaw(filePath) {
+  try {
+    return await readFile2(filePath, "utf8");
+  } catch {
+    return null;
+  }
+}
+async function releaseGuardIfTokenMatches(guardPath, expectedToken) {
+  try {
+    const current = await readFile2(guardPath, "utf8");
+    if (current !== expectedToken) return;
+    await rm2(guardPath, { force: true });
+  } catch {
+  }
+}
+function defaultIsPidAlive3(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+}
+function isAlreadyExistsError2(error) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+}
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ../core-daemon/bootstrap/discovery-claim.ts
+var DiscoveryClaimLostError = class extends Error {
+  winner;
+  constructor(winner) {
+    super(
+      `agents-comm-bus daemon already running on port ${winner.port} (pid ${winner.pid}, state root ${winner.stateRoot})`
+    );
+    this.name = "DiscoveryClaimLostError";
+    this.winner = winner;
+  }
+};
+var OWNER_FILE = "owner.json";
+function discoveryOwnerFile(discoveryRoot2) {
+  return path5.join(discoveryRoot2, OWNER_FILE);
+}
+async function readDiscoveryClaim(discoveryRoot2) {
+  const read = await readDiscoveryClaimRaw(discoveryRoot2);
+  return read?.claim;
+}
+async function readDiscoveryClaimRaw(discoveryRoot2) {
+  try {
+    const raw = await readFile3(discoveryOwnerFile(discoveryRoot2), "utf8");
+    if (raw.length === 0) return void 0;
+    const claim = parseDiscoveryClaim(raw);
+    if (!claim) return void 0;
+    return { raw, claim };
+  } catch {
+    return void 0;
+  }
+}
+function parseDiscoveryClaim(raw) {
+  if (raw.length === 0) return void 0;
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.pid !== "number" || !Number.isInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.port !== "number" || !Number.isInteger(parsed.port) || parsed.port <= 0 || parsed.port >= 65536 || typeof parsed.stateRoot !== "string" || parsed.stateRoot.length === 0 || typeof parsed.protocolVersion !== "string" || parsed.protocolVersion.length === 0) {
+      return void 0;
+    }
+    const startedAt = parsed.startedAt === null || parsed.startedAt === void 0 ? null : typeof parsed.startedAt === "number" && Number.isFinite(parsed.startedAt) ? parsed.startedAt : void 0;
+    if (startedAt === void 0 && parsed.startedAt !== null && parsed.startedAt !== void 0) {
+      return void 0;
+    }
+    const nonce = typeof parsed.nonce === "string" ? parsed.nonce : void 0;
+    return {
+      pid: parsed.pid,
+      port: parsed.port,
+      stateRoot: parsed.stateRoot,
+      startedAt: startedAt ?? null,
+      protocolVersion: parsed.protocolVersion,
+      ...nonce !== void 0 ? { nonce } : {}
+    };
+  } catch {
+    return void 0;
+  }
+}
+function discoveryClaimIdentityMatches(claim, selfPid, selfStartedAt) {
+  if (claim.pid !== selfPid) return false;
+  if (claim.startedAt == null || selfStartedAt == null) return true;
+  return claim.startedAt === selfStartedAt;
+}
+async function claimDiscovery(input) {
+  const paths = resolveDiscoveryPaths({
+    stateRoot: input.stateRoot,
+    discoveryRoot: input.discoveryRoot
+  });
+  await mkdir4(paths.root, { recursive: true });
+  const selfPid = input.pid ?? process.pid;
+  const selfStartedAt = input.startedAt ?? currentProcessStartEpochMs();
+  const selfClaim = {
+    pid: selfPid,
+    port: input.port,
+    stateRoot: input.stateRoot,
+    startedAt: selfStartedAt,
+    protocolVersion: input.protocolVersion ?? IPC_PROTOCOL_VERSION,
+    nonce: randomUUID2()
+  };
+  const isPidAlive2 = input.isPidAlive ?? defaultIsPidAlive4;
+  const probe = input.probeDaemon ?? ((port) => probeDaemon({ port }));
+  const auditRoot = input.auditStateRoot ?? input.stateRoot;
+  const guarded = await withDiscoveryGuard(
+    paths.root,
+    { pid: selfPid, startedAt: selfStartedAt },
+    () => claimDiscoveryInGuard({
+      paths,
+      selfClaim,
+      isPidAlive: isPidAlive2,
+      probe,
+      auditRoot,
+      beforePublish: input.beforePublish
+    }),
+    {
+      maxWaitMs: input.guardTimeoutMs,
+      isPidAlive: isPidAlive2,
+      beforeReclaim: input.beforeReclaim,
+      beforeReclaim2: input.beforeReclaim2,
+      beforeQuarantine: input.beforeQuarantine,
+      now: input.now
+    }
+  );
+  if (!guarded.ok) {
+    return { ok: false, reason: "guard_contended" };
+  }
+  return guarded.value;
+}
+async function claimDiscoveryInGuard(input) {
+  const ownerFile = discoveryOwnerFile(input.paths.root);
+  const ownerRead = await readOwnerClaimInGuard(input.paths.root);
+  if (ownerRead.invalid) {
+    await auditStaleCleanup(input.auditRoot, ownerRead.invalid, input.paths, "invalid_owner_record");
+    await writeOwnerClaimAtomic(ownerFile, input.selfClaim, { replace: true, beforePublish: input.beforePublish });
+    await writeDerivedDiscoveryFiles(input.paths, input.selfClaim);
+    return { ok: true, claim: input.selfClaim };
+  }
+  const incumbent = ownerRead.claim;
+  if (incumbent) {
+    const decision = await classifyIncumbent({
+      incumbent,
+      selfClaim: input.selfClaim,
+      isPidAlive: input.isPidAlive,
+      probe: input.probe,
+      normalizedSelfRoot: normalizeDaemonRootPath(input.selfClaim.stateRoot)
+    });
+    if (decision.action === "return") {
+      return decision.result;
+    }
+    if (decision.action === "replace") {
+      await writeOwnerClaimAtomic(ownerFile, input.selfClaim, {
+        replace: true,
+        beforePublish: input.beforePublish
+      });
+      if (decision.auditStale) {
+        await auditStaleCleanup(input.auditRoot, incumbent, input.paths);
+      }
+      if (decision.auditForeign) {
+        await auditForeignReplaced(input.auditRoot, incumbent, input.selfClaim);
+      }
+      await writeDerivedDiscoveryFiles(input.paths, input.selfClaim);
+      return { ok: true, claim: input.selfClaim };
+    }
+  }
+  const legacy = await readLegacyIncumbent(input.paths);
+  if (legacy) {
+    const decision = await classifyIncumbent({
+      incumbent: legacy,
+      selfClaim: input.selfClaim,
+      isPidAlive: input.isPidAlive,
+      probe: input.probe,
+      normalizedSelfRoot: normalizeDaemonRootPath(input.selfClaim.stateRoot)
+    });
+    if (decision.action === "return") {
+      return decision.result;
+    }
+    if (decision.action !== "replace") {
+      throw new Error("unexpected legacy incumbent decision");
+    }
+    await writeOwnerClaimAtomic(ownerFile, input.selfClaim, {
+      replace: true,
+      beforePublish: input.beforePublish
+    });
+    if (decision.auditStale || legacy.pid !== input.selfClaim.pid) {
+      await auditStaleCleanup(input.auditRoot, legacy, input.paths);
+    }
+    if (decision.auditForeign) {
+      await auditForeignReplaced(input.auditRoot, legacy, input.selfClaim);
+    }
+    await writeDerivedDiscoveryFiles(input.paths, input.selfClaim);
+    return { ok: true, claim: input.selfClaim };
+  }
+  try {
+    await writeOwnerClaimAtomic(ownerFile, input.selfClaim, {
+      replace: false,
+      beforePublish: input.beforePublish
+    });
+  } catch (error) {
+    if (!isAlreadyExistsError3(error)) throw error;
+    const raced = await readDiscoveryClaim(input.paths.root);
+    if (!raced) throw error;
+    const decision = await classifyIncumbent({
+      incumbent: raced,
+      selfClaim: input.selfClaim,
+      isPidAlive: input.isPidAlive,
+      probe: input.probe,
+      normalizedSelfRoot: normalizeDaemonRootPath(input.selfClaim.stateRoot)
+    });
+    if (decision.action === "return") return decision.result;
+    if (decision.action === "replace") {
+      await writeOwnerClaimAtomic(ownerFile, input.selfClaim, {
+        replace: true,
+        beforePublish: input.beforePublish
+      });
+      if (decision.auditStale) await auditStaleCleanup(input.auditRoot, raced, input.paths);
+      if (decision.auditForeign) await auditForeignReplaced(input.auditRoot, raced, input.selfClaim);
+      await writeDerivedDiscoveryFiles(input.paths, input.selfClaim);
+      return { ok: true, claim: input.selfClaim };
+    }
+    throw error;
+  }
+  await writeDerivedDiscoveryFiles(input.paths, input.selfClaim);
+  return { ok: true, claim: input.selfClaim };
+}
+async function readOwnerClaimInGuard(discoveryRoot2) {
+  try {
+    const raw = await readFile3(discoveryOwnerFile(discoveryRoot2), "utf8");
+    if (raw.length === 0) {
+      return { invalid: invalidOwnerPlaceholder() };
+    }
+    const parsed = parseDiscoveryClaim(raw);
+    if (!parsed) {
+      return { invalid: invalidOwnerPlaceholder() };
+    }
+    return { claim: parsed };
+  } catch {
+    return {};
+  }
+}
+function invalidOwnerPlaceholder() {
+  return {
+    pid: 0,
+    port: 0,
+    stateRoot: "",
+    startedAt: null,
+    protocolVersion: ""
+  };
+}
+async function classifyIncumbent(input) {
+  if (discoveryClaimIdentityMatches(input.incumbent, input.selfClaim.pid, input.selfClaim.startedAt ?? null) && input.incumbent.port === input.selfClaim.port) {
+    return { action: "return", result: { ok: true, claim: input.incumbent } };
+  }
+  const alive = input.isPidAlive(input.incumbent.pid);
+  if (!alive) {
+    return { action: "replace", auditStale: true };
+  }
+  let hello;
+  try {
+    hello = await input.probe(input.incumbent.port);
+  } catch (error) {
+    const refused = error?.code === "ECONNREFUSED";
+    if (refused) {
+      return { action: "replace", auditStale: true };
+    }
+    return {
+      action: "return",
+      result: { ok: false, reason: "incumbent_busy", incumbent: input.incumbent }
+    };
+  }
+  const reported = hello.metadata?.stateRoot;
+  const normalizedIncumbentRoot = typeof reported === "string" && reported.length > 0 ? normalizeDaemonRootPath(reported) : normalizeDaemonRootPath(input.incumbent.stateRoot);
+  if (normalizedIncumbentRoot === input.normalizedSelfRoot) {
+    return {
+      action: "return",
+      result: { ok: false, reason: "incumbent", winner: input.incumbent }
+    };
+  }
+  if (input.incumbent.stateRoot === "" && (typeof reported !== "string" || reported.length === 0)) {
+    return {
+      action: "return",
+      result: { ok: false, reason: "incumbent", winner: input.incumbent }
+    };
+  }
+  return { action: "replace", auditForeign: true };
+}
+async function readLegacyIncumbent(paths) {
+  const pid = await readPidFile(paths.pidFile);
+  const port = await readPortFile(paths.portFile);
+  if (pid === void 0 || port === void 0) return void 0;
+  return {
+    pid,
+    port,
+    stateRoot: "",
+    startedAt: null,
+    protocolVersion: IPC_PROTOCOL_VERSION
+  };
+}
+async function writeOwnerClaimAtomic(ownerFile, claim, options) {
+  const nonce = claim.nonce ?? randomUUID2();
+  const claimWithNonce = { ...claim, nonce };
+  const payload = `${JSON.stringify(claimWithNonce)}
+`;
+  const clock = options.now ?? Date.now;
+  const tempFile = `${ownerFile}.tmp.${claim.pid}.${clock()}.${nonce}`;
+  try {
+    await writeFile2(tempFile, payload, { encoding: "utf8", flag: "wx" });
+    await options.beforePublish?.();
+    if (options.replace) {
+      await rename2(tempFile, ownerFile);
+      return;
+    }
+    try {
+      await link2(tempFile, ownerFile);
+    } catch (error) {
+      if (!isAlreadyExistsError3(error)) throw error;
+      throw error;
+    }
+  } finally {
+    await rm3(tempFile, { force: true });
+  }
+}
+async function writeDerivedDiscoveryFiles(paths, claim, now) {
+  await writeFile2(paths.pidFile, `${claim.pid}
+`, "utf8");
+  const clock = now ?? Date.now;
+  const nonce = randomUUID2();
+  const portTemp = `${paths.portFile}.tmp.${claim.pid}.${clock()}.${nonce}`;
+  try {
+    await writeFile2(portTemp, `${claim.port}
+`, { encoding: "utf8", flag: "wx" });
+    await rename2(portTemp, paths.portFile);
+  } finally {
+    await rm3(portTemp, { force: true });
+  }
+}
+async function auditStaleCleanup(stateRoot2, stale, paths, reason) {
+  const audit = new JsonlAuditStore(stateRoot2);
+  await audit.append({
+    timestamp: Date.now(),
+    kind: "discovery_stale_cleanup",
+    detail: {
+      stale_pid: stale.pid > 0 ? stale.pid : void 0,
+      stale_port: stale.port > 0 ? stale.port : void 0,
+      pid_file: paths.pidFile,
+      port_file: paths.portFile,
+      owner_file: discoveryOwnerFile(paths.root),
+      ...reason ? { reason } : {}
+    }
+  });
+}
+async function auditForeignReplaced(stateRoot2, previous, current) {
+  const audit = new JsonlAuditStore(stateRoot2);
+  await audit.append({
+    timestamp: Date.now(),
+    kind: "daemon_discovery_foreign_owner_replaced",
+    detail: {
+      previous_pid: previous.pid,
+      previous_state_root: previous.stateRoot,
+      previous_port: previous.port,
+      pid: current.pid,
+      state_root: current.stateRoot,
+      port: current.port
+    }
+  });
+}
+async function writeDaemonDiscoveryFiles(input) {
+  const stateRoot2 = input.stateRoot;
+  if (!stateRoot2) {
+    throw new Error("writeDaemonDiscoveryFiles requires stateRoot");
+  }
+  const result = await claimDiscovery({
+    stateRoot: stateRoot2,
+    discoveryRoot: input.discoveryRoot,
+    pid: input.pid,
+    port: input.port,
+    startedAt: input.startedAt,
+    isPidAlive: input.isPidAlive,
+    probeDaemon: input.probeDaemon,
+    auditStateRoot: stateRoot2
+  });
+  if (!result.ok) {
+    if (result.reason === "incumbent") {
+      throw new DiscoveryClaimLostError(result.winner);
+    }
+    if (result.reason === "guard_contended") {
+      throw new Error(
+        `agents-comm-bus daemon discovery guard contended; refusing to overwrite discovery with port ${input.port}`
+      );
+    }
+    throw new Error(
+      `agents-comm-bus daemon pid ${result.incumbent.pid} is alive but unresponsive; refusing to overwrite discovery with port ${input.port}`
+    );
+  }
+}
 async function readPortFile(portFile) {
   try {
-    const raw = (await readFile2(portFile, "utf8")).trim();
+    const raw = (await readFile3(portFile, "utf8")).trim();
     const port = Number(raw);
     return Number.isInteger(port) && port > 0 && port < 65536 ? port : void 0;
   } catch {
     return void 0;
   }
 }
-async function writeDaemonDiscoveryFiles(input) {
-  const paths = resolveDiscoveryPaths({
-    stateRoot: input.stateRoot,
-    discoveryRoot: input.discoveryRoot
-  });
-  await mkdir3(paths.root, { recursive: true });
-  const existingPort = await readPortFile(paths.portFile);
-  if (existingPort !== void 0 && existingPort !== input.port) {
-    const probe = input.probeDaemon ?? ((port) => probeDaemon({ port }));
-    let existingDaemonIsLive = false;
-    try {
-      await probe(existingPort);
-      existingDaemonIsLive = true;
-    } catch {
-      existingDaemonIsLive = false;
-    }
-    if (existingDaemonIsLive) {
-      throw new Error(
-        `agents-comm-bus daemon already running on port ${existingPort}; refusing to overwrite discovery with port ${input.port}`
-      );
-    }
+async function readPidFile(pidFile) {
+  try {
+    const raw = (await readFile3(pidFile, "utf8")).trim();
+    const pid = Number(raw);
+    return Number.isInteger(pid) && pid > 0 ? pid : void 0;
+  } catch {
+    return void 0;
   }
-  await writeFile(paths.pidFile, `${input.pid ?? process.pid}
-`, "utf8");
-  await writeFile(paths.portFile, `${input.port}
-`, "utf8");
+}
+function defaultIsPidAlive4(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+}
+function isAlreadyExistsError3(error) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
 }
 
 // ../core-daemon/bootstrap/boot-scope-restore.ts
 import { access } from "node:fs/promises";
 import { join as join2 } from "node:path";
-
-// ../core-daemon/runtime/session-owner-liveness.ts
-var DEFAULT_SESSION_OWNER_RECENCY_MS = 24 * 60 * 60 * 1e3;
-function defaultIsPidAlive2(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-function classifySessionOwnerProcess(session, options = {}) {
-  const pid = session.lease_owner_process_pid;
-  const registeredAt = session.lease_owner_process_registered_at;
-  if (pid == null || registeredAt == null) return "no_owner";
-  const isPidAlive2 = options.isPidAlive ?? defaultIsPidAlive2;
-  if (!isPidAlive2(pid)) return "dead";
-  const now = options.now ?? Date.now;
-  const recencyMs = options.recencyMs ?? DEFAULT_SESSION_OWNER_RECENCY_MS;
-  if (now() - registeredAt > recencyMs) return "stale";
-  return "live";
-}
-function createSessionOwnerLiveness(options = {}) {
-  return (session) => session.lease_holder_connection_id != null || classifySessionOwnerProcess(session, options) === "live";
-}
-
-// ../core-daemon/bootstrap/boot-scope-restore.ts
 var DEFAULT_BOOT_RESTORE_RECENCY_MS = DEFAULT_SESSION_OWNER_RECENCY_MS;
-async function defaultPathExists(path8) {
+async function defaultPathExists(path12) {
   try {
-    await access(path8);
+    await access(path12);
     return true;
   } catch {
     return false;
@@ -4776,6 +6154,7 @@ async function runBootScopeRestore(input) {
       return summary;
     }
     const sessions = await input.storage.listSessions({ status: "active" });
+    await input.prefetchIdentities?.(sessions.flatMap((session) => session.lease_owner_process_pid == null ? [] : [session.lease_owner_process_pid]));
     summary.candidates = sessions.length;
     const scopesToRestore = /* @__PURE__ */ new Map();
     for (const session of sessions) {
@@ -4843,31 +6222,60 @@ async function runBootScopeRestore(input) {
 }
 
 // ../core-daemon/bootstrap/daemon-retirement.ts
-import { readFile as readFile3, rm as rm3 } from "node:fs/promises";
+import { readFile as readFile4, rm as rm4 } from "node:fs/promises";
 var IDLE_NO_OWNED_RESOURCES_REASON = "idle_no_owned_resources";
 function discoveryFilesMatchSelf(input) {
   return input.onDiskPid === input.selfPid && input.onDiskPort === input.selfPort;
+}
+function ownerRecordMatchesSelf(owner, selfPid, selfPort, selfStartedAt) {
+  return owner.pid === selfPid && owner.port === selfPort && (owner.startedAt == null || selfStartedAt == null || owner.startedAt === selfStartedAt);
 }
 async function removeDiscoveryFilesIfOwned(input) {
   const paths = resolveDiscoveryPaths({
     stateRoot: input.stateRoot,
     discoveryRoot: input.discoveryRoot
   });
-  const readPid = input.readPidFile ?? readDiscoveryPidFile;
-  const readPort = input.readPortFile ?? readDiscoveryPortFile;
-  const onDiskPid = await readPid(paths.pidFile);
-  const onDiskPort = await readPort(paths.portFile);
-  if (!discoveryFilesMatchSelf({
-    selfPid: input.selfPid,
-    selfPort: input.selfPort,
-    onDiskPid,
-    onDiskPort
-  })) {
-    return false;
-  }
-  await rm3(paths.pidFile, { force: true });
-  await rm3(paths.portFile, { force: true });
-  return true;
+  const selfStartedAt = input.selfStartedAt ?? currentProcessStartEpochMs();
+  const isPidAlive2 = input.isPidAlive ?? defaultIsPidAlive5;
+  const guarded = await withDiscoveryGuard(
+    paths.root,
+    { pid: input.selfPid, startedAt: selfStartedAt },
+    async () => {
+      const readPid = input.readPidFile ?? readDiscoveryPidFile;
+      const readPort = input.readPortFile ?? readDiscoveryPortFile;
+      const onDiskPid = await readPid(paths.pidFile);
+      const onDiskPort = await readPort(paths.portFile);
+      const owner = await readDiscoveryClaim(paths.root);
+      if (owner !== void 0) {
+        if (!ownerRecordMatchesSelf(owner, input.selfPid, input.selfPort, selfStartedAt)) {
+          return false;
+        }
+      } else if (!discoveryFilesMatchSelf({
+        selfPid: input.selfPid,
+        selfPort: input.selfPort,
+        onDiskPid,
+        onDiskPort
+      })) {
+        return false;
+      }
+      const reread = await readDiscoveryClaim(paths.root);
+      if (reread !== void 0) {
+        if (!ownerRecordMatchesSelf(reread, input.selfPid, input.selfPort, selfStartedAt)) {
+          return false;
+        }
+      }
+      await rm4(paths.pidFile, { force: true });
+      await rm4(paths.portFile, { force: true });
+      await rm4(discoveryOwnerFile(paths.root), { force: true });
+      return true;
+    },
+    {
+      maxWaitMs: input.guardTimeoutMs,
+      isPidAlive: isPidAlive2
+    }
+  );
+  if (!guarded.ok) return false;
+  return guarded.value;
 }
 var globalRetiring = false;
 async function retireDaemon(options) {
@@ -4891,7 +6299,8 @@ async function retireDaemon(options) {
         stateRoot: options.stateRoot,
         discoveryRoot: options.discoveryRoot,
         selfPid,
-        selfPort: options.port
+        selfPort: options.port,
+        selfStartedAt: currentProcessStartEpochMs()
       }).then(() => void 0),
       "remove discovery files during daemon retirement"
     );
@@ -4935,7 +6344,7 @@ function bestEffortSync(action, label) {
 }
 async function readDiscoveryPidFile(pidFile) {
   try {
-    const raw = (await readFile3(pidFile, "utf8")).trim();
+    const raw = (await readFile4(pidFile, "utf8")).trim();
     const pid = Number(raw);
     return Number.isInteger(pid) && pid > 0 ? pid : null;
   } catch {
@@ -4944,16 +6353,24 @@ async function readDiscoveryPidFile(pidFile) {
 }
 async function readDiscoveryPortFile(portFile) {
   try {
-    const raw = (await readFile3(portFile, "utf8")).trim();
+    const raw = (await readFile4(portFile, "utf8")).trim();
     const port = Number(raw);
     return Number.isInteger(port) && port > 0 && port < 65536 ? port : null;
   } catch {
     return null;
   }
 }
+function defaultIsPidAlive5(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+}
 
 // ../core-daemon/bootstrap/pid-watchdog.ts
-import { readFile as readFile4 } from "node:fs/promises";
+import { readFile as readFile5 } from "node:fs/promises";
 function startDaemonPidWatchdog(options) {
   const intervalMs = options.intervalMs ?? 3e4;
   const initialDelayMs = options.initialDelayMs ?? 5e3;
@@ -5021,27 +6438,41 @@ async function runDaemonPidWatchdogTick(options) {
 }
 async function checkDaemonPidOwnership(options) {
   const selfPid = options.selfPid ?? process.pid;
-  const read = options.readPidFile ?? readPidFile;
-  const isPidAlive2 = options.isPidAlive ?? defaultIsPidAlive3;
+  const selfStartedAt = options.selfStartedAt ?? currentProcessStartEpochMs();
+  const read = options.readPidFile ?? readPidFile2;
+  const isPidAlive2 = options.isPidAlive ?? defaultIsPidAlive6;
   const writeDiscovery = options.writeDiscoveryFiles ?? writeDaemonDiscoveryFiles;
+  const discoveryRoot2 = options.discoveryRoot ?? options.stateRoot;
+  if (discoveryRoot2) {
+    const owner = await readDiscoveryClaim(discoveryRoot2);
+    if (owner) {
+      if (discoveryClaimIdentityMatches(owner, selfPid, selfStartedAt)) {
+        return { status: "current", selfPid };
+      }
+      let ownerAlive2;
+      try {
+        ownerAlive2 = isPidAlive2(owner.pid);
+      } catch (error) {
+        return {
+          status: "stayed_alive",
+          selfPid,
+          reason: "liveness_error",
+          ownerPid: owner.pid,
+          error: errorMessage(error)
+        };
+      }
+      if (ownerAlive2 && owner.pid !== selfPid) {
+        return { status: "superseded", selfPid, ownerPid: owner.pid };
+      }
+      if (!ownerAlive2) {
+        return await reclaimDiscovery(options, selfPid, writeDiscovery, owner.pid);
+      }
+      return { status: "superseded", selfPid, ownerPid: owner.pid };
+    }
+  }
   const pidFile = await read(options.pidFile);
   if (pidFile.status === "missing") {
-    try {
-      await writeDiscovery({
-        stateRoot: options.stateRoot,
-        discoveryRoot: options.discoveryRoot,
-        pid: selfPid,
-        port: options.port
-      });
-      return { status: "reclaimed", selfPid, reason: "missing" };
-    } catch (error) {
-      return {
-        status: "stayed_alive",
-        selfPid,
-        reason: "reclaim_error",
-        error: errorMessage(error)
-      };
-    }
+    return await reclaimDiscovery(options, selfPid, writeDiscovery);
   }
   if (pidFile.status === "invalid") {
     return {
@@ -5077,32 +6508,45 @@ async function checkDaemonPidOwnership(options) {
   if (ownerAlive) {
     return { status: "superseded", selfPid, ownerPid: pidFile.pid };
   }
+  return await reclaimDiscovery(options, selfPid, writeDiscovery, pidFile.pid);
+}
+async function reclaimDiscovery(options, selfPid, writeDiscovery, previousPid) {
+  if (!options.stateRoot) {
+    return {
+      status: "stayed_alive",
+      selfPid,
+      reason: "reclaim_error",
+      ownerPid: previousPid,
+      error: "stateRoot is required to reclaim discovery"
+    };
+  }
   try {
     await writeDiscovery({
-      stateRoot: options.stateRoot,
+      stateRoot: options.stateRoot ?? "",
       discoveryRoot: options.discoveryRoot,
       pid: selfPid,
-      port: options.port
+      port: options.port,
+      startedAt: options.selfStartedAt
     });
     return {
       status: "reclaimed",
       selfPid,
-      reason: "dead_owner",
-      ownerPid: pidFile.pid
+      reason: previousPid === void 0 ? "missing" : "dead_owner",
+      ...previousPid === void 0 ? {} : { ownerPid: previousPid }
     };
   } catch (error) {
     return {
       status: "stayed_alive",
       selfPid,
       reason: "reclaim_error",
-      ownerPid: pidFile.pid,
+      ownerPid: previousPid,
       error: errorMessage(error)
     };
   }
 }
-async function readPidFile(pidFile) {
+async function readPidFile2(pidFile) {
   try {
-    const raw = (await readFile4(pidFile, "utf8")).trim();
+    const raw = (await readFile5(pidFile, "utf8")).trim();
     const pid = Number(raw);
     if (Number.isInteger(pid) && pid > 0) return { status: "pid", pid };
     return { status: "invalid", raw };
@@ -5111,7 +6555,7 @@ async function readPidFile(pidFile) {
     return { status: "error", error };
   }
 }
-function defaultIsPidAlive3(pid) {
+function defaultIsPidAlive6(pid) {
   try {
     process.kill(pid, 0);
     return true;
@@ -5133,228 +6577,19 @@ function errorMessage(error) {
 // ../core-daemon/bus.ts
 import crypto from "node:crypto";
 
-// ../core-daemon/session-label-scope.ts
-function parseAgentsCommLabels(raw) {
-  if (raw === void 0 || raw === null) return null;
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) return null;
-  const map = {};
-  for (const entry of trimmed.split(",")) {
-    const piece = entry.trim();
-    if (piece.length === 0) {
-      throw new Error(`AGENTS_COMM_LABELS contains an empty entry in "${raw}"`);
-    }
-    const colon = piece.indexOf(":");
-    if (colon <= 0 || colon === piece.length - 1) {
-      throw new Error(
-        `AGENTS_COMM_LABELS entry "${piece}" is malformed; expected comm:label`
-      );
-    }
-    const comm = piece.slice(0, colon).trim();
-    const label = piece.slice(colon + 1).trim();
-    if (comm.length === 0 || label.length === 0) {
-      throw new Error(
-        `AGENTS_COMM_LABELS entry "${piece}" is malformed; expected comm:label`
-      );
-    }
-    if (map[comm] !== void 0) {
-      throw new Error(`AGENTS_COMM_LABELS lists comm "${comm}" more than once`);
-    }
-    map[comm] = label;
-  }
-  return map;
+// ../core-daemon/runtime/inbound-message-context.ts
+var INBOUND_MESSAGE_CONTEXT_KEY = "__agents_comm_bus_inbound_context";
+function readInboundMessageContext(message) {
+  const descriptor = Object.getOwnPropertyDescriptor(message, INBOUND_MESSAGE_CONTEXT_KEY);
+  const ctx = descriptor?.value;
+  if (!ctx || ctx.kind !== "curl_idempotency") return null;
+  if (typeof ctx.scope?.registration_id !== "string") return null;
+  if (typeof ctx.scope?.sender_id !== "string") return null;
+  if (typeof ctx.scope?.client_key !== "string") return null;
+  return ctx;
 }
-function serializeAccountLabelScope(scope) {
-  if (!scope || Object.keys(scope).length === 0) return null;
-  const sorted = Object.keys(scope).sort();
-  const canonical = {};
-  for (const comm of sorted) {
-    canonical[comm] = scope[comm];
-  }
-  return JSON.stringify(canonical);
-}
-function parseAccountLabelScope(stored) {
-  if (stored === void 0 || stored === null) return null;
-  const trimmed = stored.trim();
-  if (trimmed.length === 0) return null;
-  let parsed;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    throw new Error(`account_label_scope is not valid JSON: ${stored}`);
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error(`account_label_scope must be a JSON object: ${stored}`);
-  }
-  const map = {};
-  for (const [comm, label] of Object.entries(parsed)) {
-    if (typeof label !== "string" || label.length === 0) {
-      throw new Error(`account_label_scope value for "${comm}" must be a non-empty string`);
-    }
-    map[comm] = label;
-  }
-  return map;
-}
-function accountLabelScopeFromParams(params) {
-  if (params.account_label_scope === null) return null;
-  if (typeof params.account_label_scope === "string") {
-    return serializeAccountLabelScope(parseAccountLabelScope(params.account_label_scope));
-  }
-  if (typeof params.comm_labels === "string") {
-    return serializeAccountLabelScope(parseAgentsCommLabels(params.comm_labels));
-  }
-  return null;
-}
-function filterRegistrationsByScope(registrations, scopeStored) {
-  const scope = parseRoutingScope(scopeStored);
-  if (scope === void 0) return [];
-  if (!scope) return [...registrations];
-  return registrations.filter((reg) => {
-    const expected = scope[reg.comm];
-    return expected !== void 0 && reg.account_label === expected;
-  });
-}
-function liveSessionScopeCandidates(target, sessions, isSessionLive) {
-  const liveSiblings = sessions.filter(
-    (session) => session.session_id !== target.session_id && session.project === target.project && session.agent === target.agent && session.status === "active" && isSessionLive(session)
-  );
-  return [target, ...liveSiblings];
-}
-function filterRegistrationsForSession(registrations, target, sessions, isSessionLive = hasLiveConnectionLease) {
-  if (target.account_label_scope != null) {
-    return filterRegistrationsByScope(
-      registrations,
-      target.account_label_scope
-    );
-  }
-  const labeledSiblings = liveSessionScopeCandidates(
-    target,
-    sessions,
-    isSessionLive
-  ).filter(
-    (session) => session.session_id !== target.session_id && session.account_label_scope != null
-  );
-  if (labeledSiblings.length === 0) return [...registrations];
-  return registrations.filter(
-    (registration) => !labeledSiblings.some(
-      (session) => registrationMatchesConversationScope(
-        session.account_label_scope,
-        registration
-      )
-    )
-  );
-}
-function sessionOwnsConversation(target, sessions, conversation, isSessionLive = hasLiveConnectionLease) {
-  if (conversation.project !== target.project || conversation.agent !== target.agent) {
-    return false;
-  }
-  const resolved = resolveSessionForConversation(
-    liveSessionScopeCandidates(target, sessions, isSessionLive),
-    conversation,
-    (session) => session.session_id
-  );
-  return resolved?.session_id === target.session_id;
-}
-function registrationMatchesConversationScope(scopeStored, conversation) {
-  const scope = parseRoutingScope(scopeStored);
-  if (scope === void 0) return false;
-  if (!scope) return true;
-  const expected = scope[conversation.comm];
-  return expected !== void 0 && expected === conversation.account_label;
-}
-function resolveSessionForConversation(sessions, conversation, pickSessionId) {
-  const labeledMatches = sessions.filter(
-    (sess) => sess.account_label_scope != null && registrationMatchesConversationScope(sess.account_label_scope, conversation)
-  );
-  if (labeledMatches.length > 0) {
-    return labeledMatches[0];
-  }
-  const unlabeled = sessions.filter((sess) => sess.account_label_scope == null);
-  if (unlabeled.length === 1) {
-    return unlabeled[0];
-  }
-  if (unlabeled.length > 1) {
-    return void 0;
-  }
-  return void 0;
-}
-function hasLiveConnectionLease(session) {
-  return session.lease_holder_connection_id != null;
-}
-function parseRoutingScope(stored) {
-  try {
-    return parseAccountLabelScope(stored ?? null);
-  } catch (error) {
-    console.error(
-      `agents-comm-bus: invalid persisted account_label_scope; treating session as scope-inert: ${error instanceof Error ? error.message : String(error)}`
-    );
-    return void 0;
-  }
-}
-
-// ../packages/core-contracts/dist/types.js
-var SCHEMA_VERSION_QUERY = 1;
-var SCHEMA_VERSION_CONVERSATION = 1;
-var SCHEMA_VERSION_SESSION = 1;
-
-// ../packages/core-contracts/dist/query-semantics.js
-function isExpired(query, now) {
-  return query.created_at + query.ttl_seconds * 1e3 <= now;
-}
-function tryResolve(query, decision, now) {
-  if (query.resolution !== void 0) {
-    return { kind: "rejected", reason: "already_resolved" };
-  }
-  if (isExpired(query, now)) {
-    return { kind: "rejected", reason: "expired" };
-  }
-  if (query.origin_chat !== void 0 && !sameChat(query.origin_chat, decision.decided_in_chat)) {
-    return { kind: "rejected", reason: "wrong_chat" };
-  }
-  return { kind: "accepted" };
-}
-function sameChat(a, b) {
-  return a.comm === b.comm && a.account === b.account && a.chat_native_id === b.chat_native_id && a.thread_native_id === b.thread_native_id;
-}
-
-// ../packages/core-contracts/dist/security.js
-function assertHasOrigin(message) {
-  if (!message.origin || !message.origin.agent && !message.origin.comm) {
-    throw new Error("Message missing origin label");
-  }
-}
-var RecentSeenCache = class {
-  ttlMs;
-  seenMap = /* @__PURE__ */ new Map();
-  constructor(ttlMs = 6e4) {
-    this.ttlMs = ttlMs;
-  }
-  /** True if the key is currently tracked. Also evicts expired entries. */
-  seen(key, now) {
-    this.evict(now);
-    return this.seenMap.has(key);
-  }
-  /** Record a key at time `now`. Also evicts expired entries. */
-  record(key, now) {
-    this.evict(now);
-    this.seenMap.set(key, now);
-  }
-  evict(now) {
-    for (const [id, ts] of this.seenMap) {
-      if (now - ts > this.ttlMs)
-        this.seenMap.delete(id);
-    }
-  }
-};
-var DEFAULT_FOREIGN_BOT_POLICY = {
-  allowForeignBots: false
-};
-function isForeignBotAllowed(sender, policy = DEFAULT_FOREIGN_BOT_POLICY) {
-  if (!sender.isForeignBot)
-    return true;
-  if (policy.allowForeignBots)
-    return true;
-  return policy.allowedBotIds?.includes(sender.id) ?? false;
+function readCurlIdempotencyScope(message) {
+  return readInboundMessageContext(message)?.scope ?? null;
 }
 
 // ../core-daemon/bus.ts
@@ -5396,7 +6631,7 @@ var MessageBus = class {
     comm.onConnectionState((state) => {
       void this.options.audit.append({
         timestamp: this.now(),
-        kind: state === "disconnected" ? "outbound_failed" : "inbound_received",
+        kind: "connection_state_changed",
         detail: { comm: comm.id, account: comm.accountId, connection_state: state }
       });
     });
@@ -5455,6 +6690,10 @@ var MessageBus = class {
   }
   async receiveInbound(message) {
     assertHasOrigin(message);
+    const curlScope = readCurlIdempotencyScope(message);
+    if (curlScope) {
+      return this.receiveInboundForCurlIdempotency(message, curlScope);
+    }
     const seenKey = `${message.chat.comm}:${message.chat.account}:${message.message_id}`;
     if (this.seen.seen(seenKey, this.now())) {
       await this.options.audit.append({
@@ -5529,23 +6768,217 @@ var MessageBus = class {
     }
     return conversation;
   }
-  async send(request) {
-    const target = request.target ?? await this.targetFromSession(request.session);
-    if (target.comm !== request.comm) {
-      throw new Error(`target comm ${target.comm} does not match requested comm ${request.comm}`);
-    }
-    const registration = await this.registrationFor(target);
-    const comm = this.comms.get(adapterKey(target.comm, registration.bot_user_id));
-    if (!comm) {
+  /**
+   * AGE-96: crash-resumable inbound path for curl POSTs that carry an
+   * idempotency scope. Progress markers live on the scoped curl receipt —
+   * the default receiveInbound path above is unchanged for all other comms.
+   */
+  async receiveInboundForCurlIdempotency(message, scope) {
+    const storage = this.options.storage;
+    let receipt = await storage.getCurlInboundReceipt(scope);
+    if (!receipt) {
       throw new Error(
-        `comm adapter not registered: ${target.comm}/${registration.bot_user_id}`
+        `curl idempotency receipt missing for ${scope.registration_id}/${scope.sender_id}`
       );
     }
-    const sent = await comm.send(
-      target,
-      request.payload,
-      request.idempotencyKey ?? randomId("outbound")
+    if (receipt.state === "accepted" && receipt.conversation_id) {
+      const done = await storage.getConversation(receipt.conversation_id);
+      if (done) return done;
+    }
+    const receivingAdapter = this.comms.get(
+      adapterKey(message.chat.comm, message.chat.account)
     );
+    const foreignBotPolicy = {
+      allowForeignBots: false,
+      allowedBotIds: receivingAdapter?.allowedSenderIds
+    };
+    if (!isForeignBotAllowed(message.sender, foreignBotPolicy)) {
+      await this.options.audit.append({
+        timestamp: this.now(),
+        kind: "loop_prevention_drop",
+        detail: {
+          message_id: message.message_id,
+          reason: "foreign_bot",
+          sender_id: message.sender.id,
+          comm: message.chat.comm,
+          account: message.chat.account,
+          chat_native_id: message.chat.chat_native_id,
+          platform_message_id: message.platform_message_id,
+          sender_is_bot: message.sender.isBot
+        }
+      });
+      throw new Error(`foreign bot sender rejected: ${message.sender.id}`);
+    }
+    const registration = await this.registrationFor(message.chat);
+    this.assertCurlIdempotencyScope(message, scope, registration, receipt);
+    let conversation;
+    if (receipt.conversation_id) {
+      conversation = await storage.getConversation(receipt.conversation_id) ?? await this.upsertConversation(registration, message);
+    } else {
+      conversation = await this.upsertConversation(registration, message);
+      await storage.markCurlReceiptConversation(scope, conversation.conversation_id);
+    }
+    receipt = await storage.getCurlInboundReceipt(scope) ?? receipt;
+    const now = this.now();
+    if (receipt.transcript_recorded_at == null) {
+      const recordedAt = await this.transcriptInboundTimestamp(
+        conversation.conversation_id,
+        message.message_id
+      );
+      if (recordedAt == null) {
+        await this.options.transcripts.append({
+          conversation_id: conversation.conversation_id,
+          timestamp: message.received_at,
+          direction: "inbound",
+          message_id: message.message_id,
+          payload: message
+        });
+      }
+      await storage.touchConversationInbound(
+        conversation.conversation_id,
+        recordedAt ?? message.received_at,
+        message.message_id
+      );
+      await storage.markCurlReceiptTranscript(scope, now);
+    }
+    receipt = await storage.getCurlInboundReceipt(scope) ?? receipt;
+    const auditAt = receipt.audit_recorded_at ?? receipt.reserved_at;
+    const auditDone = receipt.audit_recorded_at != null || await this.auditHasInboundReceived(conversation.conversation_id, message, auditAt);
+    if (!auditDone) {
+      await this.options.audit.append({
+        timestamp: auditAt,
+        kind: "inbound_received",
+        agent: registration.agent,
+        conversation_id: conversation.conversation_id,
+        detail: {
+          comm: registration.comm,
+          account: message.chat.account,
+          account_label: registration.account_label,
+          platform_message_id: message.platform_message_id
+        }
+      });
+      await storage.markCurlReceiptAudit(scope, auditAt);
+    }
+    receipt = await storage.getCurlInboundReceipt(scope) ?? receipt;
+    if (receipt.query_consumed_at == null) {
+      const consumedByQuery = await this.tryResolveOpenQuery(conversation, message, {
+        scope,
+        receipt,
+        now
+      });
+      if (consumedByQuery) return conversation;
+    }
+    receipt = await storage.getCurlInboundReceipt(scope) ?? receipt;
+    const dispatchDone = receipt.query_consumed_at != null || receipt.dispatch_recorded_at != null || await storage.hasPendingInboundDelivery({
+      conversation_id: conversation.conversation_id,
+      message_id: message.message_id,
+      comm: message.chat.comm,
+      account: String(message.chat.account)
+    });
+    if (!dispatchDone && this.dispatchSink) {
+      await this.dispatchSink.enqueueInbound(message, conversation);
+      await storage.markCurlReceiptDispatch(scope, now);
+    }
+    return conversation;
+  }
+  async transcriptInboundTimestamp(conversation_id, message_id) {
+    for await (const entry of this.options.transcripts.read(conversation_id)) {
+      if (entry.direction === "inbound" && entry.message_id === message_id) {
+        return entry.timestamp;
+      }
+    }
+    return null;
+  }
+  assertCurlIdempotencyScope(message, scope, registration, receipt) {
+    if (message.chat.comm !== "curl") {
+      throw new Error(
+        `curl idempotency context on non-curl message: ${message.chat.comm}`
+      );
+    }
+    if (scope.registration_id !== registration.registration_id) {
+      throw new Error(
+        `curl idempotency registration_id mismatch: scope=${scope.registration_id} registration=${registration.registration_id}`
+      );
+    }
+    if (scope.sender_id !== message.sender.id) {
+      throw new Error(
+        `curl idempotency sender_id mismatch: scope=${scope.sender_id} message=${message.sender.id}`
+      );
+    }
+    if (receipt.message_id !== message.message_id) {
+      throw new Error(
+        `curl idempotency message_id mismatch: receipt=${receipt.message_id} message=${message.message_id}`
+      );
+    }
+  }
+  async auditHasInboundReceived(conversation_id, message, auditProbeAt) {
+    const audit = this.options.audit;
+    if (typeof audit.hasInboundReceived !== "function") return false;
+    return audit.hasInboundReceived(conversation_id, message, auditProbeAt);
+  }
+  async send(request) {
+    let target;
+    try {
+      target = request.target ?? await this.targetFromSession(request.session);
+    } catch (cause) {
+      await this.auditRoutingFailure("target_resolution_failed", request, cause);
+      throw cause;
+    }
+    if (target.comm !== request.comm) {
+      const error = new Error(`target comm ${target.comm} does not match requested comm ${request.comm}`);
+      await this.auditRoutingFailure("comm_mismatch", request, error, target);
+      throw error;
+    }
+    let registration;
+    try {
+      registration = await this.registrationFor(target);
+    } catch (cause) {
+      await this.auditRoutingFailure("registration_resolution_failed", request, cause, target);
+      throw cause;
+    }
+    const comm = this.comms.get(adapterKey(target.comm, registration.bot_user_id));
+    if (!comm) {
+      const error = new Error(
+        `comm adapter not registered: ${target.comm}/${registration.bot_user_id}`
+      );
+      await this.auditRoutingFailure("adapter_not_registered", request, error, target, registration);
+      throw error;
+    }
+    let sent;
+    try {
+      sent = await comm.send(
+        target,
+        request.payload,
+        request.idempotencyKey ?? randomId("outbound")
+      );
+    } catch (error) {
+      let failureClassification;
+      try {
+        failureClassification = comm.classifyFailure(error);
+      } catch {
+        failureClassification = void 0;
+      }
+      try {
+        await this.options.audit.append({
+          timestamp: this.now(),
+          kind: "outbound_failed",
+          agent: registration.agent,
+          session: request.session,
+          detail: {
+            comm: request.comm,
+            account: registration.bot_user_id,
+            account_label: registration.account_label,
+            chat_native_id: target.chat_native_id,
+            thread_native_id: target.thread_native_id ?? null,
+            requested_account: request.target?.account ?? null,
+            error: error instanceof Error ? error.message : String(error),
+            ...failureClassification !== void 0 ? { failure_classification: failureClassification } : {}
+          }
+        });
+      } catch {
+      }
+      throw error;
+    }
     const messageId = makeMessageId(request.comm, sent.platform_message_id);
     const conversation = await this.findConversationForTarget(target);
     await this.options.transcripts.append({
@@ -5626,29 +7059,52 @@ var MessageBus = class {
       detail: { query_id: query.query_id, kind: query.kind }
     });
   }
-  async tryResolveOpenQuery(conversation, message) {
+  async tryResolveOpenQuery(conversation, message, curlRecovery) {
+    const storage = this.options.storage;
+    if (curlRecovery?.receipt.planned_query_id) {
+      const plannedId = curlRecovery.receipt.planned_query_id;
+      const record = await storage.getQuery(plannedId);
+      if (!record) return false;
+      if (record.resolved_at != null) {
+        await storage.markCurlReceiptQueryConsumed(curlRecovery.scope, curlRecovery.now);
+        return true;
+      }
+      if (!message.text) return false;
+      const chat2 = chatRefFromConversation(conversation);
+      const decision = decisionFromMessage(record, message, chat2, this.now());
+      if (!decision) return false;
+      return this.resolveQueryForCurlRecovery(plannedId, decision, curlRecovery);
+    }
     if (!message.text) return false;
-    const open4 = await this.options.storage.listOpenQueriesByConversation(
+    const open5 = await this.options.storage.listOpenQueriesByConversation(
       conversation.conversation_id
     );
-    if (open4.length === 0) return false;
+    if (open5.length === 0) return false;
     const chat = chatRefFromConversation(conversation);
     if (message.reply_to) {
-      const target = open4.find((q) => q.source_message_id === message.reply_to);
+      const target = open5.find((q) => q.source_message_id === message.reply_to);
       if (target) {
         const decision = decisionFromMessage(target, message, chat, this.now());
         if (!decision) return false;
-        return this.resolveQuery(target.query_id, decision);
+        return this.resolveQueryForCurlRecovery(
+          target.query_id,
+          decision,
+          curlRecovery
+        );
       }
     }
-    const candidates = open4.map((q) => ({
+    const candidates = open5.map((q) => ({
       query: q,
       decision: decisionFromMessage(q, message, chat, this.now())
     })).filter((entry) => entry.decision !== null);
     const strict = candidates.filter((entry) => entry.query.kind !== "freetext");
     const pool = strict.length > 0 ? strict : candidates;
     if (pool.length === 1) {
-      return this.resolveQuery(pool[0].query.query_id, pool[0].decision);
+      return this.resolveQueryForCurlRecovery(
+        pool[0].query.query_id,
+        pool[0].decision,
+        curlRecovery
+      );
     }
     if (pool.length > 1) {
       await this.sendAmbiguousReplyHelper(
@@ -5656,9 +7112,28 @@ var MessageBus = class {
         pool.map((entry) => entry.query),
         message
       );
+      if (curlRecovery) {
+        await storage.markCurlReceiptQueryConsumed(curlRecovery.scope, curlRecovery.now);
+      }
       return true;
     }
     return false;
+  }
+  async resolveQueryForCurlRecovery(queryId, decision, curlRecovery) {
+    if (curlRecovery) {
+      await this.options.storage.markCurlReceiptPlannedQuery(
+        curlRecovery.scope,
+        queryId
+      );
+    }
+    const resolved = await this.resolveQuery(queryId, decision);
+    if (curlRecovery && resolved) {
+      await this.options.storage.markCurlReceiptQueryConsumed(
+        curlRecovery.scope,
+        curlRecovery.now
+      );
+    }
+    return resolved;
   }
   /**
    * AGE-9: a bare reply matched more than one open query — never guess which
@@ -5736,17 +7211,17 @@ var MessageBus = class {
     return resolved;
   }
   async resolveQueryFromCallback(input) {
-    const open4 = await this.options.storage.getOpenQueryById(input.queryId);
-    if (!open4) {
+    const open5 = await this.options.storage.getOpenQueryById(input.queryId);
+    if (!open5) {
       const existing = await this.options.storage.getQuery(input.queryId);
       return { kind: existing ? "already_resolved" : "unknown_query" };
     }
     if (input.value === "other") {
       const ok = await this.options.storage.updateQueryKind(input.queryId, "freetext");
       if (!ok) return { kind: "already_resolved" };
-      return { kind: "awaiting_freetext", query: open4 };
+      return { kind: "awaiting_freetext", query: open5 };
     }
-    const decision = decisionFromCallbackValue(open4, input.value, input.fromId, input.chat, this.now());
+    const decision = decisionFromCallbackValue(open5, input.value, input.fromId, input.chat, this.now());
     if (!decision) return { kind: "invalid_value", value: input.value };
     const stored = await this.options.storage.resolveQuery(
       input.queryId,
@@ -5761,12 +7236,12 @@ var MessageBus = class {
     await this.options.audit.append({
       timestamp: this.now(),
       kind: "query_resolved",
-      agent: open4.agent,
-      session: open4.session,
+      agent: open5.agent,
+      session: open5.session,
       detail: { query_id: input.queryId, decision: decision.decision, via: "callback" }
     });
-    await this.notifyResolveSinks(open4, decision, input.queryId);
-    return { kind: "resolved", decision, query: open4 };
+    await this.notifyResolveSinks(open5, decision, input.queryId);
+    return { kind: "resolved", decision, query: open5 };
   }
   async listConversations(filter) {
     return this.options.storage.listConversations({
@@ -5787,6 +7262,40 @@ var MessageBus = class {
    * `targetFromSession`, and `origin_chat` is built by `chatRefForConversation`
    * (which returns `bot_user_id`). A label reaching here now fails loud.
    */
+  /**
+   * AGE-95: best-effort audit of a pre-adapter routing failure. NEVER throws —
+   * an audit-append failure must not mask the original routing error
+   * (rethrow-literal, same discipline as AGE-93). Context is progressive:
+   * request comm/session/requested account always; resolved target when known;
+   * registration identity only after it resolves. No payload content.
+   */
+  async auditRoutingFailure(reason, request, cause, target, registration) {
+    try {
+      await this.options.audit.append({
+        timestamp: this.now(),
+        kind: "outbound_routing_failed",
+        agent: registration?.agent,
+        session: request.session,
+        detail: {
+          reason,
+          comm: request.comm,
+          requested_account: request.target?.account ?? null,
+          ...target ? {
+            target_comm: target.comm,
+            target_account: target.account,
+            chat_native_id: target.chat_native_id,
+            thread_native_id: target.thread_native_id ?? null
+          } : {},
+          ...registration ? {
+            account: registration.bot_user_id,
+            account_label: registration.account_label
+          } : {},
+          error: cause instanceof Error ? cause.message : String(cause)
+        }
+      });
+    } catch {
+    }
+  }
   async registrationFor(chat) {
     const byBot = await this.options.storage.getAccountByBot(
       chat.comm,
@@ -6008,8 +7517,173 @@ function adapterKey(commId, accountId) {
 // ../core-daemon/storage/sqlite.ts
 import { createRequire } from "node:module";
 
+// ../core-daemon/runtime/herdr.ts
+import crypto2 from "node:crypto";
+import { execFile as execFile2 } from "node:child_process";
+import { promisify } from "node:util";
+import path6 from "node:path";
+var execFileAsync = promisify(execFile2);
+function normalizeHerdrSocketPath(socketPath) {
+  const resolved = path6.resolve(socketPath);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+function herdrSessionId(identity) {
+  const socket = normalizeHerdrSocketPath(identity.socket_path);
+  const digest = crypto2.createHash("sha256").update(`${identity.agent}
+${socket}
+${identity.pane_id}`).digest("hex").slice(0, 24);
+  return `herdr_${digest}`;
+}
+function parseHerdrIdentity(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw;
+  if (record.type !== "herdr") return null;
+  const agent = record.agent;
+  const pane_id = record.pane_id;
+  const socket_path = record.socket_path;
+  if (typeof agent !== "string" || agent.trim() === "") return null;
+  if (typeof pane_id !== "string" || pane_id.trim() === "") return null;
+  if (typeof socket_path !== "string" || socket_path.trim() === "") return null;
+  const identity = {
+    type: "herdr",
+    agent,
+    pane_id,
+    socket_path
+  };
+  if (typeof record.workspace_id === "string" && record.workspace_id.length > 0) {
+    identity.workspace_id = record.workspace_id;
+  }
+  if (typeof record.tab_id === "string" && record.tab_id.length > 0) {
+    identity.tab_id = record.tab_id;
+  }
+  if (typeof record.bin_path === "string" && record.bin_path.length > 0) {
+    identity.bin_path = record.bin_path;
+  }
+  return identity;
+}
+function parseHerdrIdentityJson(json) {
+  if (!json) return null;
+  try {
+    return parseHerdrIdentity(JSON.parse(json));
+  } catch {
+    return null;
+  }
+}
+var DEFAULT_TIMEOUT_MS = 5e3;
+var HerdrClient = class {
+  constructor(identity, options = {}) {
+    this.identity = identity;
+    this.options = options;
+  }
+  identity;
+  options;
+  async agentGet() {
+    const parsed = await this.runJson(["agent", "get", this.identity.pane_id]);
+    if (!parsed.ok) return parsed;
+    const result = parsed.data;
+    const agent = result?.result?.agent;
+    if (!agent || typeof agent !== "object") {
+      return { ok: true, data: null };
+    }
+    const pane_id = typeof agent.pane_id === "string" ? agent.pane_id : this.identity.pane_id;
+    const kind = typeof agent.agent === "string" ? agent.agent : "";
+    return {
+      ok: true,
+      data: {
+        pane_id,
+        agent: kind,
+        agent_status: typeof agent.agent_status === "string" ? agent.agent_status : void 0,
+        cwd: typeof agent.cwd === "string" ? agent.cwd : void 0,
+        name: typeof agent.name === "string" ? agent.name : void 0
+      }
+    };
+  }
+  async agentPrompt(text) {
+    return this.runJson(["agent", "prompt", this.identity.pane_id, text]);
+  }
+  async agentSendKeys(...keys) {
+    return this.runJson(["agent", "send-keys", this.identity.pane_id, ...keys]);
+  }
+  async paneSendText(text) {
+    return this.runJson(["pane", "send-text", this.identity.pane_id, text]);
+  }
+  async runJson(args) {
+    const env = {
+      ...this.options.env ?? process.env,
+      HERDR_SOCKET_PATH: this.identity.socket_path
+    };
+    const bin = this.options.resolveBin?.(this.identity, env) ?? resolveHerdrBin(this.identity, env);
+    const execFn = this.options.execFile ?? defaultExecFile;
+    try {
+      const { stdout } = await execFn(bin, args, {
+        env,
+        timeout: DEFAULT_TIMEOUT_MS,
+        windowsHide: true
+      });
+      const trimmed = stdout.trim();
+      if (!trimmed) return { ok: true, data: {} };
+      return { ok: true, data: JSON.parse(trimmed) };
+    } catch (error) {
+      return parseHerdrExecFailure(error);
+    }
+  }
+};
+function defaultExecFile(file, args, options) {
+  return execFileAsync(file, args, {
+    env: options.env,
+    timeout: options.timeout,
+    windowsHide: options.windowsHide
+  });
+}
+function resolveHerdrBin(identity, env = process.env) {
+  if (identity.bin_path) return identity.bin_path;
+  const fromEnv = env.AGENTS_COMM_BUS_HERDR_BIN;
+  if (typeof fromEnv === "string" && fromEnv.trim().length > 0) {
+    return fromEnv.trim();
+  }
+  return process.platform === "win32" ? "herdr.exe" : "herdr";
+}
+function parseHerdrExecFailure(error) {
+  const err = error;
+  const stderr = typeof err.stderr === "string" ? err.stderr.trim() : "";
+  if (stderr) {
+    try {
+      const parsed = JSON.parse(stderr);
+      if (parsed.error?.code) {
+        return {
+          ok: false,
+          code: parsed.error.code,
+          message: parsed.error.message ?? parsed.error.code
+        };
+      }
+    } catch {
+    }
+  }
+  return {
+    ok: false,
+    code: err.code ?? "herdr_cli_failed",
+    message: err.message ?? String(error)
+  };
+}
+async function validateHerdrIdentityAgent(client, identity) {
+  const got = await client.agentGet();
+  if (!got.ok) {
+    return { ok: false, reason: `herdr_agent_get_failed:${got.code}` };
+  }
+  if (!got.data) {
+    return { ok: false, reason: "herdr_pane_missing" };
+  }
+  if (got.data.agent !== identity.agent) {
+    return {
+      ok: false,
+      reason: `herdr_agent_mismatch:${got.data.agent}`
+    };
+  }
+  return { ok: true };
+}
+
 // ../core-daemon/storage/schema/runner.ts
-import { readFile as readFile5 } from "node:fs/promises";
+import { readFile as readFile6 } from "node:fs/promises";
 import { dirname as dirname2, join as join3 } from "node:path";
 import { fileURLToPath } from "node:url";
 var SqliteMigrationRunner = class {
@@ -6038,7 +7712,7 @@ var initialMigration = {
   version: 1,
   description: "initial storage schema",
   async up(ctx) {
-    const sql = await readFile5(join3(schemaDir, "001_initial.sql"), "utf8");
+    const sql = await readFile6(join3(schemaDir, "001_initial.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -6046,7 +7720,7 @@ var conversationAgentIdentityMigration = {
   version: 2,
   description: "include agent in conversation identity",
   async up(ctx) {
-    const sql = await readFile5(join3(schemaDir, "002_conversation_agent_identity.sql"), "utf8");
+    const sql = await readFile6(join3(schemaDir, "002_conversation_agent_identity.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -6054,7 +7728,7 @@ var allowlistMigration = {
   version: 3,
   description: "add allowlist_global and allowlist_per_bot tables",
   async up(ctx) {
-    const sql = await readFile5(join3(schemaDir, "003_allowlist.sql"), "utf8");
+    const sql = await readFile6(join3(schemaDir, "003_allowlist.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -6062,7 +7736,7 @@ var sessionOwnerProcessMigration = {
   version: 4,
   description: "track owning agent process for session leases",
   async up(ctx) {
-    const sql = await readFile5(join3(schemaDir, "004_session_owner_process.sql"), "utf8");
+    const sql = await readFile6(join3(schemaDir, "004_session_owner_process.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -6070,7 +7744,7 @@ var conversationBotIdentityMigration = {
   version: 5,
   description: "store receiving bot identity on conversations",
   async up(ctx) {
-    const sql = await readFile5(join3(schemaDir, "005_conversation_bot_identity.sql"), "utf8");
+    const sql = await readFile6(join3(schemaDir, "005_conversation_bot_identity.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -6078,7 +7752,7 @@ var registrationIdentityMigration = {
   version: 6,
   description: "add immutable registration_id surrogate to registrations + conversations",
   async up(ctx) {
-    const sql = await readFile5(join3(schemaDir, "006_registration_identity.sql"), "utf8");
+    const sql = await readFile6(join3(schemaDir, "006_registration_identity.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -6086,7 +7760,7 @@ var registrationPkMigration = {
   version: 7,
   description: "make registration_id the canonical primary key of account_registrations",
   async up(ctx) {
-    const sql = await readFile5(join3(schemaDir, "007_registration_pk.sql"), "utf8");
+    const sql = await readFile6(join3(schemaDir, "007_registration_pk.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -6094,7 +7768,7 @@ var conversationRegistrationKeyMigration = {
   version: 8,
   description: "re-key conversations on (registration_id, chat, thread) + drop account_label",
   async up(ctx) {
-    const sql = await readFile5(join3(schemaDir, "008_conversation_registration_key.sql"), "utf8");
+    const sql = await readFile6(join3(schemaDir, "008_conversation_registration_key.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -6102,7 +7776,7 @@ var multiOpenQueriesMigration = {
   version: 9,
   description: "AGE-9: drop the one-open-query-per-session unique index (policy moves to callers)",
   async up(ctx) {
-    const sql = await readFile5(join3(schemaDir, "009_multi_open_queries.sql"), "utf8");
+    const sql = await readFile6(join3(schemaDir, "009_multi_open_queries.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -6110,7 +7784,7 @@ var durablePendingInboundMigration = {
   version: 10,
   description: "AGE-56: durable pending inbound delivery rows",
   async up(ctx) {
-    const sql = await readFile5(join3(schemaDir, "010_durable_pending_inbound.sql"), "utf8");
+    const sql = await readFile6(join3(schemaDir, "010_durable_pending_inbound.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -6118,7 +7792,7 @@ var sessionDaemonOwnerMigration = {
   version: 11,
   description: "AGE-58: stamp daemon-instance identity on session leases",
   async up(ctx) {
-    const sql = await readFile5(join3(schemaDir, "011_session_daemon_owner.sql"), "utf8");
+    const sql = await readFile6(join3(schemaDir, "011_session_daemon_owner.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -6126,7 +7800,42 @@ var sessionLabelScopeMigration = {
   version: 12,
   description: "AGE-72: per-session comm account-label scoping",
   async up(ctx) {
-    const sql = await readFile5(join3(schemaDir, "012_session_label_scope.sql"), "utf8");
+    const sql = await readFile6(join3(schemaDir, "012_session_label_scope.sql"), "utf8");
+    await ctx.exec(sql);
+  }
+};
+var curlInboundIdempotencyMigration = {
+  version: 13,
+  description: "AGE-96: curl inbound idempotency receipts + acceptance progress",
+  async up(ctx) {
+    const sql = await readFile6(join3(schemaDir, "013_curl_inbound_idempotency.sql"), "utf8");
+    await ctx.exec(sql);
+  }
+};
+var registrationActivationMigration = {
+  version: 14,
+  description: "AGE-97: account_registrations activation flag (lazy | eager)",
+  async up(ctx) {
+    const sql = await readFile6(join3(schemaDir, "014_registration_activation.sql"), "utf8");
+    await ctx.exec(sql);
+  }
+};
+var sessionOwnerProcessStartTimeMigration = {
+  version: 15,
+  description: "AGE-101: process start epoch for pid+start-time owner liveness",
+  async up(ctx) {
+    const sql = await readFile6(
+      join3(schemaDir, "015_session_owner_process_start_time.sql"),
+      "utf8"
+    );
+    await ctx.exec(sql);
+  }
+};
+var herdrWakeMigration = {
+  version: 16,
+  description: "AGE-110: herdr wake identity + wake mode preferences",
+  async up(ctx) {
+    const sql = await readFile6(join3(schemaDir, "016_herdr_wake.sql"), "utf8");
     await ctx.exec(sql);
   }
 };
@@ -6143,7 +7852,11 @@ async function runStorageMigrations(db) {
     multiOpenQueriesMigration,
     durablePendingInboundMigration,
     sessionDaemonOwnerMigration,
-    sessionLabelScopeMigration
+    sessionLabelScopeMigration,
+    curlInboundIdempotencyMigration,
+    registrationActivationMigration,
+    sessionOwnerProcessStartTimeMigration,
+    herdrWakeMigration
   ]);
 }
 
@@ -6167,8 +7880,8 @@ var SqliteStorage = class _SqliteStorage {
     this.db = db;
   }
   db;
-  static async open(path8) {
-    const db = new DatabaseSync(path8);
+  static async open(path12) {
+    const db = new DatabaseSync(path12);
     db.exec("PRAGMA foreign_keys = ON");
     db.exec("PRAGMA busy_timeout = 5000");
     await runStorageMigrations(db);
@@ -6179,8 +7892,8 @@ var SqliteStorage = class _SqliteStorage {
     this.db.prepare(`
         INSERT INTO account_registrations (
           schema_version, registration_id, project, comm, agent, account_label,
-          bot_user_id, credentials_ref, bot_username, created_at, updated_at, metadata_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          bot_user_id, credentials_ref, activation, bot_username, created_at, updated_at, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(project, comm, agent, account_label) DO UPDATE SET
           bot_user_id = excluded.bot_user_id,
           credentials_ref = excluded.credentials_ref,
@@ -6196,6 +7909,7 @@ var SqliteStorage = class _SqliteStorage {
       rec.account_label,
       rec.bot_user_id,
       rec.credentials_ref,
+      rec.activation ?? "lazy",
       rec.bot_username ?? null,
       rec.created_at,
       rec.updated_at,
@@ -6204,6 +7918,10 @@ var SqliteStorage = class _SqliteStorage {
   }
   async getAccountByBot(comm, bot_user_id) {
     const row = this.db.prepare("SELECT * FROM account_registrations WHERE comm = ? AND bot_user_id = ?").get(comm, bot_user_id);
+    return row ? this.accountFromRow(row) : null;
+  }
+  async getAccountByRegistrationId(registration_id) {
+    const row = this.db.prepare("SELECT * FROM account_registrations WHERE registration_id = ?").get(registration_id);
     return row ? this.accountFromRow(row) : null;
   }
   async listAccountRegistrations(filter = {}) {
@@ -6352,6 +8070,42 @@ var SqliteStorage = class _SqliteStorage {
       if (Number(result.changes ?? 0) !== 1) {
         throw new Error(
           `failed to relabel account registration for ${input.comm}/${input.bot_user_id}`
+        );
+      }
+      const nextRow = this.db.prepare("SELECT * FROM account_registrations WHERE registration_id = ?").get(previous.registration_id);
+      if (!nextRow) {
+        throw new Error(`updated account registration not found for ${previous.registration_id}`);
+      }
+      this.db.exec("COMMIT");
+      return { previous, next: this.accountFromRow(nextRow) };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  async updateAccountRegistrationActivation(input) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const previousRow = this.db.prepare("SELECT * FROM account_registrations WHERE comm = ? AND bot_user_id = ?").get(input.comm, input.bot_user_id);
+      if (!previousRow) {
+        throw new Error(
+          `no account registration found for (comm=${input.comm}, bot-id=${input.bot_user_id})`
+        );
+      }
+      const previous = this.accountFromRow(previousRow);
+      if (previous.activation === input.activation) {
+        this.db.exec("COMMIT");
+        return { previous, next: previous };
+      }
+      const result = this.db.prepare(`
+          UPDATE account_registrations
+          SET activation = ?,
+              updated_at = ?
+          WHERE registration_id = ?
+        `).run(input.activation, input.updated_at, previous.registration_id);
+      if (Number(result.changes ?? 0) !== 1) {
+        throw new Error(
+          `failed to update activation for account registration ${previous.registration_id}`
         );
       }
       const nextRow = this.db.prepare("SELECT * FROM account_registrations WHERE registration_id = ?").get(previous.registration_id);
@@ -6620,12 +8374,12 @@ var SqliteStorage = class _SqliteStorage {
           schema_version, session_id, agent, project, created_at,
           lease_holder_connection_id, lease_acquired_at, lease_released_at,
           lease_owner_process_pid, lease_owner_process_label,
-          lease_owner_process_registered_at,
+          lease_owner_process_registered_at, lease_owner_process_start_time,
           lease_owner_daemon_discovery_root, lease_owner_daemon_checkout_root,
           lease_owner_daemon_state_root, lease_owner_daemon_bin,
           lease_owner_daemon_authority_rank,
           most_recent_inbound_conversation_id, account_label_scope, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id) DO UPDATE SET
           agent = excluded.agent,
           project = excluded.project,
@@ -6643,6 +8397,7 @@ var SqliteStorage = class _SqliteStorage {
       rec.lease_owner_process_pid,
       rec.lease_owner_process_label,
       rec.lease_owner_process_registered_at,
+      rec.lease_owner_process_start_time ?? null,
       rec.lease_owner_daemon_discovery_root,
       rec.lease_owner_daemon_checkout_root,
       rec.lease_owner_daemon_state_root,
@@ -6654,6 +8409,12 @@ var SqliteStorage = class _SqliteStorage {
     );
   }
   async acquireSessionLease(session, connection_id, at, owner) {
+    const ownerPid = owner?.process_pid ?? null;
+    let ownerStartTime = owner?.process_start_time ?? null;
+    if (ownerPid != null && ownerStartTime == null) {
+      await prefetchProcessStartIdentity([ownerPid]);
+      ownerStartTime = readProcessStartEpochMs(ownerPid);
+    }
     try {
       const result = this.db.prepare(`
           UPDATE sessions
@@ -6669,6 +8430,7 @@ var SqliteStorage = class _SqliteStorage {
               lease_owner_process_pid = ?,
               lease_owner_process_label = ?,
               lease_owner_process_registered_at = ?,
+              lease_owner_process_start_time = ?,
               lease_owner_daemon_discovery_root = ?,
               lease_owner_daemon_checkout_root = ?,
               lease_owner_daemon_state_root = ?,
@@ -6679,9 +8441,10 @@ var SqliteStorage = class _SqliteStorage {
         `).run(
         connection_id,
         at,
-        owner?.process_pid ?? null,
+        ownerPid,
         owner?.process_label ?? null,
-        owner?.process_pid ? at : null,
+        ownerPid ? at : null,
+        ownerPid ? ownerStartTime : null,
         owner?.daemon?.discovery_root ?? null,
         owner?.daemon?.checkout_root ?? null,
         owner?.daemon?.state_root ?? null,
@@ -6704,6 +8467,7 @@ var SqliteStorage = class _SqliteStorage {
             lease_owner_process_pid = NULL,
             lease_owner_process_label = NULL,
             lease_owner_process_registered_at = NULL,
+            lease_owner_process_start_time = NULL,
             lease_owner_daemon_discovery_root = NULL,
             lease_owner_daemon_checkout_root = NULL,
             lease_owner_daemon_state_root = NULL,
@@ -6740,6 +8504,10 @@ var SqliteStorage = class _SqliteStorage {
             (lease_owner_process_registered_at IS NULL AND ? IS NULL)
             OR lease_owner_process_registered_at = ?
           )
+          AND (
+            (lease_owner_process_start_time IS NULL AND ? IS NULL)
+            OR lease_owner_process_start_time = ?
+          )
       `).run(
       at,
       session,
@@ -6749,7 +8517,9 @@ var SqliteStorage = class _SqliteStorage {
       observed.lease_owner_process_pid,
       observed.lease_owner_process_pid,
       observed.lease_owner_process_registered_at,
-      observed.lease_owner_process_registered_at
+      observed.lease_owner_process_registered_at,
+      observed.lease_owner_process_start_time,
+      observed.lease_owner_process_start_time
     );
     return Number(result.changes ?? 0) > 0;
   }
@@ -6788,6 +8558,101 @@ var SqliteStorage = class _SqliteStorage {
         SET most_recent_inbound_conversation_id = ?
         WHERE session_id = ?
       `).run(conversation_id, session);
+  }
+  async setSessionWakeTarget(session, identity, wake_strict) {
+    const sets = [];
+    const params = [];
+    if (identity !== void 0) {
+      sets.push("wake_identity_json = ?");
+      params.push(
+        identity == null ? null : JSON.stringify(identity)
+      );
+    }
+    if (wake_strict !== void 0) {
+      sets.push("wake_strict = ?");
+      params.push(wake_strict);
+    }
+    if (sets.length === 0) return;
+    params.push(session);
+    this.db.prepare(`UPDATE sessions SET ${sets.join(", ")} WHERE session_id = ?`).run(...params);
+  }
+  async getWakeMode(project, agent) {
+    const canonical = project === "" ? "" : normalizeProjectPath(project);
+    const scoped = this.db.prepare(
+      "SELECT mode FROM wake_preferences WHERE project = ? AND agent = ?"
+    ).get(canonical, agent);
+    if (scoped?.mode === "auto" || scoped?.mode === "native") {
+      return scoped.mode;
+    }
+    const global = this.db.prepare("SELECT mode FROM wake_preferences WHERE project = '' AND agent = ?").get(agent);
+    if (global?.mode === "auto" || global?.mode === "native") {
+      return global.mode;
+    }
+    return "auto";
+  }
+  async setWakeMode(project, agent, mode, updated_at) {
+    const canonical = project === "" ? "" : normalizeProjectPath(project);
+    this.db.prepare(`
+        INSERT INTO wake_preferences (project, agent, mode, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(project, agent) DO UPDATE SET
+          mode = excluded.mode,
+          updated_at = excluded.updated_at
+      `).run(canonical, agent, mode, updated_at);
+  }
+  async clearWakeMode(project, agent) {
+    const canonical = project === "" ? "" : normalizeProjectPath(project);
+    this.db.prepare("DELETE FROM wake_preferences WHERE project = ? AND agent = ?").run(canonical, agent);
+  }
+  async listWakeModes() {
+    const rows = this.db.prepare("SELECT project, agent, mode, updated_at FROM wake_preferences ORDER BY project, agent").all();
+    return rows;
+  }
+  async insertSession(rec) {
+    const project = normalizeProjectPath(rec.project);
+    this.db.prepare(`
+        INSERT INTO sessions (
+          schema_version, session_id, agent, project, created_at,
+          lease_holder_connection_id, lease_acquired_at, lease_released_at,
+          lease_owner_process_pid, lease_owner_process_label,
+          lease_owner_process_registered_at, lease_owner_process_start_time,
+          lease_owner_daemon_discovery_root, lease_owner_daemon_checkout_root,
+          lease_owner_daemon_state_root, lease_owner_daemon_bin,
+          lease_owner_daemon_authority_rank,
+          most_recent_inbound_conversation_id, account_label_scope, status,
+          wake_identity_json, wake_strict
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+      rec.schema_version,
+      rec.session_id,
+      rec.agent,
+      project,
+      rec.created_at,
+      rec.lease_holder_connection_id,
+      rec.lease_acquired_at,
+      rec.lease_released_at,
+      rec.lease_owner_process_pid,
+      rec.lease_owner_process_label,
+      rec.lease_owner_process_registered_at,
+      rec.lease_owner_process_start_time ?? null,
+      rec.lease_owner_daemon_discovery_root,
+      rec.lease_owner_daemon_checkout_root,
+      rec.lease_owner_daemon_state_root,
+      rec.lease_owner_daemon_bin,
+      rec.lease_owner_daemon_authority_rank,
+      rec.most_recent_inbound_conversation_id,
+      rec.account_label_scope ?? null,
+      rec.status,
+      rec.wake_identity ? JSON.stringify(rec.wake_identity) : null,
+      rec.wake_strict
+    );
+  }
+  async reactivateSessionIfEnded(session) {
+    const result = this.db.prepare(`
+        UPDATE sessions SET status = 'active'
+        WHERE session_id = ? AND status = 'ended'
+      `).run(session);
+    return Number(result.changes ?? 0) > 0;
   }
   async addAllowlistGlobal(rec) {
     this.db.prepare(`
@@ -6883,6 +8748,134 @@ var SqliteStorage = class _SqliteStorage {
       stmt.run(key.conversation_id, key.message_id, key.comm, key.account);
     }
   }
+  async reserveCurlInboundReceipt(input) {
+    const existing = await this.getCurlInboundReceipt(input);
+    if (existing) {
+      if (existing.state === "accepted" && existing.expires_at <= input.reserved_at) {
+        this.db.prepare(`
+            DELETE FROM curl_inbound_receipts
+            WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+          `).run(input.registration_id, input.sender_id, input.client_key);
+      } else if (existing.request_hash !== input.request_hash) {
+        return { kind: "conflict" };
+      } else if (existing.state === "accepted") {
+        return {
+          kind: "replay",
+          message_id: existing.message_id,
+          conversation_id: existing.conversation_id
+        };
+      } else {
+        return {
+          kind: "resume",
+          message_id: existing.message_id,
+          conversation_id: existing.conversation_id
+        };
+      }
+    }
+    try {
+      this.db.prepare(`
+          INSERT INTO curl_inbound_receipts (
+            registration_id, sender_id, client_key, request_hash, message_id,
+            conversation_id, state, reserved_at, accepted_at, expires_at,
+            transcript_recorded_at, audit_recorded_at, dispatch_recorded_at,
+            query_consumed_at, planned_query_id
+          ) VALUES (?, ?, ?, ?, ?, NULL, 'pending', ?, NULL, ?, NULL, NULL, NULL, NULL, NULL)
+        `).run(
+        input.registration_id,
+        input.sender_id,
+        input.client_key,
+        input.request_hash,
+        input.message_id,
+        input.reserved_at,
+        input.expires_at
+      );
+      return { kind: "reserved", message_id: input.message_id };
+    } catch (error) {
+      if (!isSqliteUniqueViolation(error)) throw error;
+      return this.reserveCurlInboundReceipt(input);
+    }
+  }
+  async acceptCurlInboundReceipt(input) {
+    const result = this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET state = 'accepted',
+            conversation_id = ?,
+            accepted_at = ?
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+          AND state = 'pending'
+      `).run(
+      input.conversation_id,
+      input.accepted_at,
+      input.registration_id,
+      input.sender_id,
+      input.client_key
+    );
+    return (result.changes ?? 0) === 1;
+  }
+  async getCurlInboundReceipt(scope) {
+    const row = this.db.prepare(`
+        SELECT * FROM curl_inbound_receipts
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `).get(scope.registration_id, scope.sender_id, scope.client_key);
+    return row ? this.curlInboundReceiptFromRow(row) : null;
+  }
+  async deleteExpiredCurlInboundReceipts(now) {
+    const result = this.db.prepare(
+      "DELETE FROM curl_inbound_receipts WHERE state = 'accepted' AND expires_at <= ?"
+    ).run(now);
+    return result.changes ?? 0;
+  }
+  async markCurlReceiptConversation(scope, conversation_id) {
+    this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET conversation_id = COALESCE(conversation_id, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `).run(conversation_id, scope.registration_id, scope.sender_id, scope.client_key);
+  }
+  async markCurlReceiptTranscript(scope, at) {
+    this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET transcript_recorded_at = COALESCE(transcript_recorded_at, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `).run(at, scope.registration_id, scope.sender_id, scope.client_key);
+  }
+  async markCurlReceiptAudit(scope, at) {
+    this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET audit_recorded_at = COALESCE(audit_recorded_at, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `).run(at, scope.registration_id, scope.sender_id, scope.client_key);
+  }
+  async markCurlReceiptDispatch(scope, at) {
+    this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET dispatch_recorded_at = COALESCE(dispatch_recorded_at, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `).run(at, scope.registration_id, scope.sender_id, scope.client_key);
+  }
+  async markCurlReceiptQueryConsumed(scope, at) {
+    this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET query_consumed_at = COALESCE(query_consumed_at, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `).run(at, scope.registration_id, scope.sender_id, scope.client_key);
+  }
+  async markCurlReceiptPlannedQuery(scope, query_id) {
+    this.db.prepare(`
+        UPDATE curl_inbound_receipts
+        SET planned_query_id = ?
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+          AND planned_query_id IS NULL
+      `).run(query_id, scope.registration_id, scope.sender_id, scope.client_key);
+  }
+  async hasPendingInboundDelivery(key) {
+    const row = this.db.prepare(`
+        SELECT 1 AS present FROM pending_inbound_deliveries
+        WHERE conversation_id = ? AND message_id = ? AND comm = ? AND account = ?
+        LIMIT 1
+      `).get(key.conversation_id, key.message_id, key.comm, key.account);
+    return row != null;
+  }
   async close() {
     this.db.close();
   }
@@ -6918,6 +8911,7 @@ var SqliteStorage = class _SqliteStorage {
       account_label: r.account_label,
       bot_user_id: r.bot_user_id,
       credentials_ref: r.credentials_ref,
+      activation: r.activation ?? "lazy",
       bot_username: r.bot_username ?? void 0,
       created_at: r.created_at,
       updated_at: r.updated_at,
@@ -6964,6 +8958,26 @@ var SqliteStorage = class _SqliteStorage {
       options_json: r.options_json
     };
   }
+  curlInboundReceiptFromRow(row) {
+    const r = row;
+    return {
+      registration_id: r.registration_id,
+      sender_id: r.sender_id,
+      client_key: r.client_key,
+      request_hash: r.request_hash,
+      message_id: r.message_id,
+      conversation_id: r.conversation_id ?? null,
+      state: r.state,
+      reserved_at: r.reserved_at,
+      accepted_at: r.accepted_at ?? null,
+      expires_at: r.expires_at,
+      transcript_recorded_at: r.transcript_recorded_at ?? null,
+      audit_recorded_at: r.audit_recorded_at ?? null,
+      dispatch_recorded_at: r.dispatch_recorded_at ?? null,
+      query_consumed_at: r.query_consumed_at ?? null,
+      planned_query_id: r.planned_query_id ?? null
+    };
+  }
   pendingInboundDeliveryFromRow(row) {
     const r = row;
     return {
@@ -6990,6 +9004,7 @@ var SqliteStorage = class _SqliteStorage {
       lease_owner_process_pid: r.lease_owner_process_pid,
       lease_owner_process_label: r.lease_owner_process_label,
       lease_owner_process_registered_at: r.lease_owner_process_registered_at,
+      lease_owner_process_start_time: r.lease_owner_process_start_time,
       lease_owner_daemon_discovery_root: r.lease_owner_daemon_discovery_root,
       lease_owner_daemon_checkout_root: r.lease_owner_daemon_checkout_root,
       lease_owner_daemon_state_root: r.lease_owner_daemon_state_root,
@@ -6997,12 +9012,19 @@ var SqliteStorage = class _SqliteStorage {
       lease_owner_daemon_authority_rank: r.lease_owner_daemon_authority_rank,
       most_recent_inbound_conversation_id: r.most_recent_inbound_conversation_id,
       account_label_scope: r.account_label_scope ?? null,
-      status: r.status
+      status: r.status,
+      wake_identity: parseHerdrIdentityJson(r.wake_identity_json),
+      wake_strict: r.wake_strict === "herdr" ? "herdr" : null
     };
   }
 };
-async function openSqliteStorage(path8) {
-  return SqliteStorage.open(path8);
+function isSqliteUniqueViolation(error) {
+  if (error == null || typeof error !== "object") return false;
+  const sqliteError = error;
+  return sqliteError.code === "SQLITE_CONSTRAINT_UNIQUE" || sqliteError.code === "SQLITE_CONSTRAINT_PRIMARYKEY" || sqliteError.errcode === 2067 || sqliteError.errcode === 1555;
+}
+async function openSqliteStorage(path12) {
+  return SqliteStorage.open(path12);
 }
 function isConstraintError(error) {
   const sqliteError = error;
@@ -7010,10 +9032,10 @@ function isConstraintError(error) {
 }
 
 // ../core-daemon/storage/transcripts.ts
-import { createReadStream } from "node:fs";
-import { mkdir as mkdir4, stat as stat2 } from "node:fs/promises";
+import { createReadStream as createReadStream2 } from "node:fs";
+import { mkdir as mkdir5, stat as stat3 } from "node:fs/promises";
 import { dirname as dirname3, join as join4 } from "node:path";
-import { createInterface } from "node:readline/promises";
+import { createInterface as createInterface2 } from "node:readline/promises";
 function safeSegment2(value) {
   return encodeURIComponent(value);
 }
@@ -7023,20 +9045,20 @@ var JsonlTranscriptStore = class {
   }
   root;
   async append(entry) {
-    const path8 = this.pathFor(entry.conversation_id);
-    await mkdir4(dirname3(path8), { recursive: true });
-    await appendJsonLine(path8, entry);
+    const path12 = this.pathFor(entry.conversation_id);
+    await mkdir5(dirname3(path12), { recursive: true });
+    await appendJsonLine(path12, entry);
   }
   async *read(conversation_id, opts = {}) {
-    const path8 = this.pathFor(conversation_id);
+    const path12 = this.pathFor(conversation_id);
     try {
-      await stat2(path8);
+      await stat3(path12);
     } catch {
       return;
     }
     let yielded = 0;
-    const lines = createInterface({
-      input: createReadStream(path8, { encoding: "utf8" }),
+    const lines = createInterface2({
+      input: createReadStream2(path12, { encoding: "utf8" }),
       crlfDelay: Infinity
     });
     for await (const line of lines) {
@@ -7055,8 +9077,8 @@ var JsonlTranscriptStore = class {
 
 // ../core-daemon/storage/blobs.ts
 import { createHash } from "node:crypto";
-import { createReadStream as createReadStream2 } from "node:fs";
-import { mkdir as mkdir5, open as open3, stat as stat3 } from "node:fs/promises";
+import { createReadStream as createReadStream3 } from "node:fs";
+import { mkdir as mkdir6, open as open3, stat as stat4 } from "node:fs/promises";
 import { join as join5 } from "node:path";
 import { Readable } from "node:stream";
 var ContentAddressedBlobStore = class {
@@ -7067,11 +9089,11 @@ var ContentAddressedBlobStore = class {
   async put(content, mime) {
     const hash = createHash("sha256").update(content).digest("hex");
     const ref = { hash, size: content.byteLength, mime };
-    const path8 = this.pathFor(ref);
-    await mkdir5(join5(this.root, "blobs", hash.slice(0, 2)), { recursive: true });
+    const path12 = this.pathFor(ref);
+    await mkdir6(join5(this.root, "blobs", hash.slice(0, 2)), { recursive: true });
     let handle;
     try {
-      handle = await open3(path8, "wx");
+      handle = await open3(path12, "wx");
       await handle.writeFile(content);
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
@@ -7081,20 +9103,1100 @@ var ContentAddressedBlobStore = class {
     return ref;
   }
   async open(ref) {
-    return Readable.toWeb(createReadStream2(this.pathFor(ref)));
+    return Readable.toWeb(createReadStream3(this.pathFor(ref)));
   }
   pathFor(ref) {
     return join5(this.root, "blobs", ref.hash.slice(0, 2), ref.hash);
   }
   async exists(ref) {
     try {
-      const info = await stat3(this.pathFor(ref));
+      const info = await stat4(this.pathFor(ref));
       return info.isFile() && info.size === ref.size;
     } catch {
       return false;
     }
   }
 };
+
+// ../core-daemon/runtime/wake-seed.ts
+var WAKE_SEED_MAX_CHARS = 2e3;
+function sanitizeWakeSeed(text) {
+  if (!text) return "";
+  const normalized = text.replace(/\r\n?/g, "\n").replace(/[\x00-\x09\x0B-\x1F\x7F]/g, "").trim();
+  return normalized.length > WAKE_SEED_MAX_CHARS ? normalized.slice(0, WAKE_SEED_MAX_CHARS) : normalized;
+}
+function buildWakeSeed(input) {
+  const body = (input.body ?? "").trim();
+  if (!body) return "";
+  const comm = input.comm && input.comm.length > 0 ? input.comm : "message";
+  const sender = input.sender && input.sender.length > 0 ? input.sender : "unknown sender";
+  return sanitizeWakeSeed(`${comm} message from ${sender}: ${body}`);
+}
+
+// ../core-daemon/runtime/comm-lease-eligibility.ts
+function classifySessionDaemonOwner2(session, currentDiscoveryRoot) {
+  const stamped = session.lease_owner_daemon_discovery_root;
+  if (stamped == null || stamped.length === 0) return "missing";
+  return normalizeDaemonRootPath(stamped) === normalizeDaemonRootPath(currentDiscoveryRoot) ? "match" : "foreign";
+}
+function computeCommLeaseEligibility(input) {
+  const scopeSessions = input.sessions.filter((session) => session.status === "active");
+  const liveSessions = scopeSessions.filter((session) => input.sessionOwnerIsLive(session));
+  if (liveSessions.length === 0) return true;
+  const owningSessions = liveSessions.filter((session) => {
+    const regs = filterRegistrationsForSession(
+      [input.registration],
+      session,
+      scopeSessions,
+      input.sessionOwnerIsLive
+    );
+    return regs.length > 0;
+  });
+  if (owningSessions.length === 0) return true;
+  for (const session of owningSessions) {
+    const ownerClass = classifySessionDaemonOwner2(session, input.discoveryRoot);
+    if (ownerClass !== "match") return false;
+  }
+  return true;
+}
+
+// ../core-daemon/runtime/comm-adapter-lifecycle.ts
+function adapterMapKey(commId, accountId) {
+  return `${commId}:${accountId}`;
+}
+function unresolvedCredentialsReason(ref, action = "resolve") {
+  if (ref.startsWith("env:")) {
+    return `could not ${action} credentials_ref=${ref}: env: credential refs are retired; rerun account-update-token with --bot-token to create a daemon-owned file: ref`;
+  }
+  return `could not ${action} credentials_ref=${ref}`;
+}
+function logInvalidCredentialResolution(registration, commId, resolution) {
+  const pathSuffix = resolution.path ? ` [${resolution.path}]` : "";
+  console.error(
+    `agents-comm-bus: credential file for ${commId} account ${registration.account_label} (project ${registration.project}) exists but failed to resolve: ${resolution.reason}${pathSuffix}`
+  );
+}
+async function appendCredentialResolutionFailedAudit(audit, registration, commId, resolution) {
+  await audit?.append({
+    timestamp: Date.now(),
+    kind: "credential_resolution_failed",
+    agent: registration.agent,
+    detail: {
+      comm: commId,
+      account_id: registration.bot_user_id,
+      account_label: registration.account_label,
+      project: registration.project,
+      credentials_ref: registration.credentials_ref,
+      failure_kind: resolution.failureKind,
+      reason: resolution.reason,
+      credential_path: resolution.path ?? null
+    }
+  }).catch(() => {
+  });
+}
+async function createAdapterFromRegistration(input) {
+  const resolved = await input.factory.resolveCredentials(input.registration, input.env, {
+    storage: input.storage,
+    stateRoot: input.stateRoot
+  });
+  if (resolved.status !== "ok") {
+    return { adapter: null, resolution: resolved };
+  }
+  const adapter = input.factory.create(
+    resolved.credentials,
+    input.registration.bot_user_id,
+    {
+      blobs: input.blobs,
+      stateRoot: input.stateRoot,
+      registrationId: input.registration.registration_id,
+      storage: input.storage
+    }
+  );
+  if (adapter.exclusiveResource?.() != null) {
+    const leaseEligible = input.storage && input.discoveryRoot && input.sessionOwnerIsLive ? async () => {
+      const sessions = await input.storage.listSessions({
+        project: input.registration.project,
+        agent: input.registration.agent,
+        status: "active"
+      });
+      return computeCommLeaseEligibility({
+        registration: input.registration,
+        discoveryRoot: input.discoveryRoot,
+        sessions,
+        sessionOwnerIsLive: input.sessionOwnerIsLive
+      });
+    } : void 0;
+    return {
+      adapter: wrapWithLease(adapter, input.leaseArbiter, { leaseEligible }),
+      resolution: resolved
+    };
+  }
+  return { adapter, resolution: resolved };
+}
+async function removeLiveAdapter(input) {
+  const accountId = input.accountId;
+  const adapter = input.bus.unregisterComm(input.commId, accountId);
+  for (const bridge of input.bridges) {
+    bridge.detachComm?.(input.commId, accountId);
+  }
+  if (adapter) {
+    try {
+      await adapter.stop();
+    } catch (error) {
+      console.error(
+        `agents-comm-bus: failed to stop ${input.commId}/${accountId} on scope release: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+  const resource = adapter?.exclusiveResource?.();
+  if (resource) {
+    await input.leaseArbiter.release(input.commId, resource.resourceId).catch(() => {
+    });
+  }
+}
+async function addAdapterForRegistration(input) {
+  try {
+    const { adapter, resolution } = await createAdapterFromRegistration({
+      factory: input.factory,
+      registration: input.registration,
+      env: input.env,
+      blobs: input.blobs,
+      stateRoot: input.stateRoot,
+      storage: input.storage,
+      leaseArbiter: input.leaseArbiter,
+      discoveryRoot: input.discoveryRoot,
+      sessionOwnerIsLive: input.sessionOwnerIsLive
+    });
+    if (!adapter) {
+      if (resolution.status === "invalid") {
+        logInvalidCredentialResolution(input.registration, input.factory.commId, resolution);
+      }
+      return {
+        ok: false,
+        reason: resolution.status === "invalid" ? resolution.reason : unresolvedCredentialsReason(input.registration.credentials_ref),
+        retryClass: "permanent",
+        resolution
+      };
+    }
+    const accountId = input.registration.bot_user_id;
+    try {
+      input.bus.registerComm(adapter);
+      for (const bridge of input.bridges) {
+        bridge.attachComm?.(adapter);
+      }
+      await adapter.start();
+      return { ok: true };
+    } catch (error) {
+      await adapter.stop().catch(() => {
+      });
+      input.bus.unregisterComm(input.registration.comm, accountId);
+      for (const bridge of input.bridges) {
+        bridge.detachComm?.(input.registration.comm, accountId);
+      }
+      return {
+        ok: false,
+        reason: `failed to start adapter: ${error instanceof Error ? error.message : String(error)}`,
+        retryClass: "transient",
+        resolution
+      };
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `adapter construction failed: ${error instanceof Error ? error.message : String(error)}`,
+      retryClass: "transient"
+    };
+  }
+}
+
+// ../core-daemon/runtime/scope-release-reconcile.ts
+var DEFAULT_SCOPE_RELEASE_GRACE_MS = 3e4;
+function scopeKey(agent, project, accountLabelScope) {
+  return `${agent}:${normalizeProjectPath(project)}:${accountLabelScope ?? ""}`;
+}
+function isRegistrationScopeActive(registration, activeScopes) {
+  const prefix = `${registration.agent}:${normalizeProjectPath(registration.project)}:`;
+  const legacyKey = `${registration.agent}:${normalizeProjectPath(registration.project)}`;
+  for (const key of activeScopes) {
+    if (key === legacyKey) return true;
+    if (!key.startsWith(prefix)) continue;
+    const scopeStored = key.slice(prefix.length);
+    const scope = scopeStored.length > 0 ? scopeStored : null;
+    if (filterRegistrationsByScope([registration], scope).length > 0) return true;
+  }
+  return false;
+}
+function isSessionLocalLiveOwner(session, discoveryRoot2, sessionOwnerIsLive) {
+  if (session.status !== "active") return false;
+  if (!sessionOwnerIsLive(session)) return false;
+  const stamped = session.lease_owner_daemon_discovery_root;
+  if (stamped == null || stamped.length === 0) return true;
+  return normalizeDaemonRootPath(stamped) === normalizeDaemonRootPath(discoveryRoot2);
+}
+function countLocalLiveSessionsForScope(sessions, key, discoveryRoot2, sessionOwnerIsLive) {
+  let count = 0;
+  for (const session of sessions) {
+    if (scopeKey(session.agent, session.project, session.account_label_scope) !== key) {
+      continue;
+    }
+    if (!isSessionLocalLiveOwner(session, discoveryRoot2, sessionOwnerIsLive)) continue;
+    count += 1;
+  }
+  return count;
+}
+async function listAllRegistrations(storage, factories) {
+  const all = [];
+  for (const factory of factories) {
+    const regs = await storage.listAccountRegistrations({ comm: factory.commId });
+    all.push(...regs);
+  }
+  return all;
+}
+async function buildGlobalDesiredRegistrationIds(input) {
+  const allRegistrations = input.allRegistrations ?? await listAllRegistrations(input.storage, input.factories);
+  const activeSessions = input.activeSessions ?? await input.storage.listSessions({ status: "active" });
+  const desired = /* @__PURE__ */ new Set();
+  for (const reg of allRegistrations) {
+    if (reg.activation === "eager") {
+      desired.add(reg.registration_id);
+    }
+  }
+  for (const session of activeSessions) {
+    if (!isSessionLocalLiveOwner(
+      session,
+      input.discoveryRoot,
+      input.sessionOwnerIsLive
+    )) {
+      continue;
+    }
+    const projectRegs = allRegistrations.filter(
+      (reg) => reg.agent === session.agent && normalizeProjectPath(reg.project) === normalizeProjectPath(session.project)
+    );
+    const scoped = filterRegistrationsByScope(
+      projectRegs,
+      session.account_label_scope
+    );
+    for (const reg of scoped) {
+      desired.add(reg.registration_id);
+    }
+  }
+  return desired;
+}
+async function reconcileLazyAdapterScopes(input) {
+  const counts = {
+    scopes_zero_live: 0,
+    scopes_released: 0,
+    adapters_removed: 0,
+    active_scopes_pruned: 0
+  };
+  const now = (input.now ?? Date.now)();
+  const graceMs = input.graceMs ?? DEFAULT_SCOPE_RELEASE_GRACE_MS;
+  const activeSessions = await input.storage.listSessions({ status: "active" });
+  const allRegistrations = await listAllRegistrations(input.storage, input.factories);
+  const scopesReady = /* @__PURE__ */ new Set();
+  for (const key of [...input.activeScopes]) {
+    const liveCount = countLocalLiveSessionsForScope(
+      activeSessions,
+      key,
+      input.discoveryRoot,
+      input.sessionOwnerIsLive
+    );
+    if (liveCount > 0) {
+      input.state.zeroLiveSince.delete(key);
+      input.cancelGraceExpiry?.(key);
+      continue;
+    }
+    counts.scopes_zero_live += 1;
+    if (graceMs === 0) {
+      scopesReady.add(key);
+      input.state.zeroLiveSince.delete(key);
+      input.cancelGraceExpiry?.(key);
+      continue;
+    }
+    const firstZero = input.state.zeroLiveSince.get(key);
+    if (firstZero == null) {
+      input.state.zeroLiveSince.set(key, now);
+      input.scheduleGraceExpiry?.(key, graceMs);
+      continue;
+    }
+    if (now - firstZero < graceMs) continue;
+    scopesReady.add(key);
+    input.state.zeroLiveSince.delete(key);
+    input.cancelGraceExpiry?.(key);
+  }
+  if (scopesReady.size === 0) return counts;
+  const desiredRegistrationIds = await buildGlobalDesiredRegistrationIds({
+    storage: input.storage,
+    factories: input.factories,
+    discoveryRoot: input.discoveryRoot,
+    sessionOwnerIsLive: input.sessionOwnerIsLive,
+    allRegistrations,
+    activeSessions
+  });
+  const lazyRegs = allRegistrations.filter((reg) => reg.activation !== "eager");
+  for (const reg of lazyRegs) {
+    if (desiredRegistrationIds.has(reg.registration_id)) continue;
+    if (!isRegistrationScopeActive(reg, scopesReady)) continue;
+    const commId = reg.comm;
+    const accountId = reg.bot_user_id;
+    if (!input.bus.getComm(commId, accountId)) continue;
+    await input.removeAdapter({
+      bus: input.bus,
+      bridges: input.bridges,
+      leaseArbiter: input.leaseArbiter,
+      commId,
+      accountId
+    });
+    counts.adapters_removed += 1;
+  }
+  for (const key of scopesReady) {
+    counts.scopes_released += 1;
+    if (input.activeScopes.delete(key)) {
+      counts.active_scopes_pruned += 1;
+    }
+  }
+  return counts;
+}
+
+// ../core-daemon/runtime/session-end-sweep.ts
+var DEFAULT_SESSION_END_SWEEP_INTERVAL_MS = 60 * 60 * 1e3;
+function sessionEndObservation(session) {
+  return {
+    status: session.status,
+    lease_holder_connection_id: session.lease_holder_connection_id,
+    lease_owner_process_pid: session.lease_owner_process_pid,
+    lease_owner_process_registered_at: session.lease_owner_process_registered_at,
+    lease_owner_process_start_time: session.lease_owner_process_start_time
+  };
+}
+function shouldSweepEndSession(session, options = {}) {
+  const ownerState = classifySessionOwnerProcess(session, options);
+  if (ownerState === "live" || ownerState === "stale") return false;
+  if (ownerState === "no_owner") {
+    return session.lease_holder_connection_id == null;
+  }
+  return true;
+}
+async function runSessionEndSweep(input) {
+  const counts = {
+    ended: 0,
+    kept_live: 0,
+    kept_stale: 0,
+    kept_no_owner_leased: 0,
+    cas_lost: 0
+  };
+  const livenessOptions = {
+    now: input.now ?? input.ownerLivenessOptions?.now,
+    isPidAlive: input.isPidAlive ?? input.ownerLivenessOptions?.isPidAlive,
+    recencyMs: input.recencyMs ?? input.ownerLivenessOptions?.recencyMs,
+    readProcessStartEpochMs: input.ownerLivenessOptions?.readProcessStartEpochMs,
+    readProcStat: input.ownerLivenessOptions?.readProcStat,
+    readBootId: input.ownerLivenessOptions?.readBootId,
+    readProcUptime: input.ownerLivenessOptions?.readProcUptime,
+    readClockTicksPerSec: input.ownerLivenessOptions?.readClockTicksPerSec
+  };
+  const at = (input.now ?? Date.now)();
+  const sessions = await input.storage.listSessions({ status: "active" });
+  if (input.prefetchIdentities) {
+    await input.prefetchIdentities(
+      sessions.flatMap((session) => session.lease_owner_process_pid == null ? [] : [session.lease_owner_process_pid])
+    );
+  }
+  for (const session of sessions) {
+    const ownerState = classifySessionOwnerProcess(session, livenessOptions);
+    if (!shouldSweepEndSession(session, livenessOptions)) {
+      if (ownerState === "live") counts.kept_live += 1;
+      else if (ownerState === "stale") counts.kept_stale += 1;
+      else if (ownerState === "no_owner" && session.lease_holder_connection_id != null) {
+        counts.kept_no_owner_leased += 1;
+      }
+      continue;
+    }
+    const ended = await input.storage.endSessionIfUnchanged(
+      session.session_id,
+      sessionEndObservation(session),
+      at
+    );
+    if (ended) counts.ended += 1;
+    else counts.cas_lost += 1;
+  }
+  if (input.sweepHold) {
+    await input.sweepHold();
+  }
+  const log = input.log ?? (() => {
+  });
+  log(
+    `agents-comm-bus: session end sweep: ended=${counts.ended} kept_live=${counts.kept_live} kept_stale=${counts.kept_stale} kept_no_owner_leased=${counts.kept_no_owner_leased} cas_lost=${counts.cas_lost}`
+  );
+  if (input.reconcile) {
+    counts.reconcile = await reconcileLazyAdapterScopes({
+      ...input.reconcile,
+      now: input.now,
+      graceMs: input.reconcile.graceMs
+    });
+    log(
+      `agents-comm-bus: scope reconcile: zero_live=${counts.reconcile.scopes_zero_live} released=${counts.reconcile.scopes_released} adapters_removed=${counts.reconcile.adapters_removed} active_scopes_pruned=${counts.reconcile.active_scopes_pruned}`
+    );
+  }
+  return counts;
+}
+function startSessionEndSweep(options) {
+  const intervalMs = options.intervalMs ?? DEFAULT_SESSION_END_SWEEP_INTERVAL_MS;
+  const setIntervalFn = options.setIntervalFn ?? ((fn, ms) => {
+    const handle = setInterval(fn, ms);
+    handle.unref?.();
+    return handle;
+  });
+  const clearIntervalFn = options.clearIntervalFn ?? ((h) => clearInterval(h));
+  const setTimeoutFn = options.setTimeoutFn ?? ((fn, ms) => {
+    const handle = setTimeout(fn, ms);
+    handle.unref?.();
+    return handle;
+  });
+  const clearTimeoutFn = options.clearTimeoutFn ?? ((h) => clearTimeout(h));
+  let sweepInFlight = false;
+  let pendingTick = false;
+  let stopped = false;
+  let interval = null;
+  let earlyReconcile = false;
+  const reconcileState = options.reconcileState ?? {
+    zeroLiveSince: /* @__PURE__ */ new Map(),
+    graceTimers: /* @__PURE__ */ new Map()
+  };
+  if (!reconcileState.graceTimers) {
+    reconcileState.graceTimers = /* @__PURE__ */ new Map();
+  }
+  const cancelGraceExpiry = (key) => {
+    const handle = reconcileState.graceTimers.get(key);
+    if (handle != null) {
+      clearTimeoutFn(handle);
+      reconcileState.graceTimers.delete(key);
+    }
+  };
+  const scheduleGraceExpiry = (key, delayMs) => {
+    if (stopped) return;
+    cancelGraceExpiry(key);
+    const handle = setTimeoutFn(() => {
+      if (stopped) return;
+      reconcileState.graceTimers.delete(key);
+      tick();
+    }, delayMs);
+    reconcileState.graceTimers.set(key, handle);
+  };
+  const tick = () => {
+    if (stopped) return;
+    if (sweepInFlight) {
+      pendingTick = true;
+      return;
+    }
+    sweepInFlight = true;
+    const graceMs = earlyReconcile ? 0 : void 0;
+    earlyReconcile = false;
+    void runSessionEndSweep({
+      storage: options.storage,
+      prefetchIdentities: options.prefetchIdentities,
+      now: options.now,
+      isPidAlive: options.isPidAlive,
+      recencyMs: options.recencyMs,
+      ownerLivenessOptions: options.ownerLivenessOptions,
+      sweepHold: options.sweepHold,
+      log: options.log,
+      reconcile: options.reconcile != null ? {
+        ...options.reconcile,
+        state: reconcileState,
+        graceMs,
+        scheduleGraceExpiry,
+        cancelGraceExpiry
+      } : void 0
+    }).catch((error) => {
+      const log = options.log ?? console.error;
+      log(
+        `agents-comm-bus: session end sweep failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }).finally(() => {
+      sweepInFlight = false;
+      if (!stopped && pendingTick) {
+        pendingTick = false;
+        tick();
+      }
+    });
+  };
+  if (options.runOnStart !== false) {
+    tick();
+  }
+  const initial = setTimeoutFn(() => {
+    if (stopped) return;
+    interval = setIntervalFn(tick, intervalMs);
+  }, intervalMs);
+  return {
+    stop() {
+      stopped = true;
+      clearTimeoutFn(initial);
+      if (interval != null) clearIntervalFn(interval);
+      interval = null;
+      for (const key of reconcileState.graceTimers.keys()) {
+        cancelGraceExpiry(key);
+      }
+    },
+    requestEarlyReconcile() {
+      earlyReconcile = true;
+      tick();
+    }
+  };
+}
+
+// ../core-daemon/runtime/wake-target-selection.ts
+function sessionLeaseHeld(session) {
+  return session.lease_holder_connection_id != null;
+}
+function pickScopeMatchedSession(pool, conversation) {
+  if (pool.length === 0) return void 0;
+  if (!conversation) return pool[0];
+  const match = resolveSessionForConversation(
+    pool,
+    conversation,
+    (sess) => sess.session_id
+  );
+  if (match) return match;
+  if (!conversation) return void 0;
+  return pool.find((session) => session.account_label_scope == null);
+}
+async function selectActiveSessionForInboundWake(storage, project, agent, conversation, isPreferredTier) {
+  const resolved = normalizeProjectPath(project);
+  const sessions = await storage.listSessions({
+    project: resolved,
+    agent,
+    status: "active"
+  });
+  if (sessions.length === 0) return null;
+  const preferred = sessions.filter(isPreferredTier);
+  const herdr = sessions.filter(
+    (session) => !isPreferredTier(session) && session.wake_identity != null
+  );
+  const legacy = sessions.filter(
+    (session) => !isPreferredTier(session) && session.wake_identity == null
+  );
+  for (const tier of [preferred, herdr, legacy]) {
+    const picked = pickScopeMatchedSession(tier, conversation);
+    if (picked) return picked;
+  }
+  return null;
+}
+function scopesMatch(a, b) {
+  if (a.account_label_scope == null && b.account_label_scope == null) return true;
+  return a.account_label_scope === b.account_label_scope;
+}
+async function supersedeStaleSessionsOnHerdrRegister(storage, herdrSession, sessionOwnerIsLive, now = Date.now()) {
+  const sessions = await storage.listSessions({
+    project: herdrSession.project,
+    agent: herdrSession.agent,
+    status: "active"
+  });
+  for (const row of sessions) {
+    if (row.session_id === herdrSession.session_id) continue;
+    if (!scopesMatch(row, herdrSession)) continue;
+    if (sessionOwnerIsLive(row)) continue;
+    if (row.lease_holder_connection_id != null) continue;
+    await storage.endSessionIfUnchanged(
+      row.session_id,
+      sessionEndObservation(row),
+      now
+    );
+  }
+}
+
+// ../core-daemon/runtime/wake-strategy.ts
+async function resolveWakeMode(storage, project, agent) {
+  return storage.getWakeMode(project, agent);
+}
+function effectiveWakeStrategy(session, mode) {
+  if (!session.wake_identity) return "native";
+  if (session.wake_strict === "herdr") return "herdr";
+  if (mode === "auto") return "herdr";
+  return "native";
+}
+async function herdrWake(session, seedText, deps) {
+  const identity = session.wake_identity;
+  if (!identity) {
+    return { ok: false, reason: "no_herdr_identity", strict: false };
+  }
+  const mode = await resolveWakeMode(deps.storage, session.project, session.agent);
+  if (effectiveWakeStrategy(session, mode) !== "herdr") {
+    return { ok: false, reason: "strategy_native", strict: false };
+  }
+  const client = deps.clientFactory?.(identity) ?? new HerdrClient(identity);
+  const validated = await validateHerdrIdentityAgent(client, identity);
+  if (!validated.ok) {
+    const strict = session.wake_strict === "herdr";
+    await auditWakeDeliveryFailure(deps, {
+      session,
+      strategy: "herdr",
+      reason: validated.reason,
+      path: "inbound_wake"
+    });
+    return { ok: false, reason: validated.reason, strict };
+  }
+  const prompt = seedText.trim().length > 0 ? seedText : ".";
+  const prompted = await client.agentPrompt(prompt);
+  if (!prompted.ok) {
+    const strict = session.wake_strict === "herdr";
+    await auditWakeDeliveryFailure(deps, {
+      session,
+      strategy: "herdr",
+      reason: `herdr_prompt_failed:${prompted.code}`,
+      path: "inbound_wake",
+      detail: { message: prompted.message }
+    });
+    return { ok: false, reason: prompted.message, strict };
+  }
+  await auditHerdrWakeSuccess(deps, session, {
+    path: "inbound_wake",
+    pane_id: identity.pane_id
+  });
+  return { ok: true };
+}
+async function herdrRespond(session, payload, deps) {
+  const identity = session.wake_identity;
+  if (!identity) {
+    return { ok: false, reason: "no_herdr_identity", strict: false };
+  }
+  const mode = await resolveWakeMode(deps.storage, session.project, session.agent);
+  if (effectiveWakeStrategy(session, mode) !== "herdr") {
+    return { ok: false, reason: "strategy_native", strict: false };
+  }
+  const client = deps.clientFactory?.(identity) ?? new HerdrClient(identity);
+  const validated = await validateHerdrIdentityAgent(client, identity);
+  if (!validated.ok) {
+    const strict = session.wake_strict === "herdr";
+    await auditWakeDeliveryFailure(deps, {
+      session,
+      strategy: "herdr",
+      reason: validated.reason,
+      path: "resolve_sink",
+      detail: { prompt_type: payload.prompt_type }
+    });
+    return { ok: false, reason: validated.reason, strict };
+  }
+  const response = payload.response;
+  if (payload.prompt_type === "question" && /^\d+$/.test(response)) {
+    const sent = await client.agentSendKeys(response);
+    if (!sent.ok) {
+      const strict = session.wake_strict === "herdr";
+      await auditWakeDeliveryFailure(deps, {
+        session,
+        strategy: "herdr",
+        reason: `herdr_send_keys_failed:${sent.code}`,
+        path: "resolve_sink",
+        detail: { prompt_type: payload.prompt_type }
+      });
+      return { ok: false, reason: sent.message, strict };
+    }
+    await auditHerdrWakeSuccess(deps, session, {
+      path: "resolve_sink",
+      pane_id: identity.pane_id,
+      prompt_type: payload.prompt_type
+    });
+    return { ok: true };
+  }
+  let text = response;
+  if (payload.prompt_type === "freetext") {
+    text = response.replace(/[\r\n]+/g, " ").trim();
+  }
+  if (payload.prompt_type === "permission" && (response === "y" || response === "n" || response === "a")) {
+    const typed = await client.paneSendText(response);
+    if (!typed.ok) {
+      const strict = session.wake_strict === "herdr";
+      await auditWakeDeliveryFailure(deps, {
+        session,
+        strategy: "herdr",
+        reason: `herdr_send_text_failed:${typed.code}`,
+        path: "resolve_sink"
+      });
+      return { ok: false, reason: typed.message, strict };
+    }
+    const enter = await client.agentSendKeys("enter");
+    if (!enter.ok) {
+      const strict = session.wake_strict === "herdr";
+      await auditWakeDeliveryFailure(deps, {
+        session,
+        strategy: "herdr",
+        reason: `herdr_send_keys_failed:${enter.code}`,
+        path: "resolve_sink"
+      });
+      return { ok: false, reason: enter.message, strict };
+    }
+    await auditHerdrWakeSuccess(deps, session, {
+      path: "resolve_sink",
+      pane_id: identity.pane_id,
+      prompt_type: payload.prompt_type
+    });
+    return { ok: true };
+  }
+  if (payload.prompt_type === "freetext" && text) {
+    const typed = await client.paneSendText(text);
+    if (!typed.ok) {
+      const strict = session.wake_strict === "herdr";
+      await auditWakeDeliveryFailure(deps, {
+        session,
+        strategy: "herdr",
+        reason: `herdr_send_text_failed:${typed.code}`,
+        path: "resolve_sink"
+      });
+      return { ok: false, reason: typed.message, strict };
+    }
+    const enter = await client.agentSendKeys("enter");
+    if (!enter.ok) {
+      const strict = session.wake_strict === "herdr";
+      await auditWakeDeliveryFailure(deps, {
+        session,
+        strategy: "herdr",
+        reason: `herdr_send_keys_failed:${enter.code}`,
+        path: "resolve_sink"
+      });
+      return { ok: false, reason: enter.message, strict };
+    }
+    await auditHerdrWakeSuccess(deps, session, {
+      path: "resolve_sink",
+      pane_id: identity.pane_id,
+      prompt_type: payload.prompt_type
+    });
+    return { ok: true };
+  }
+  return { ok: false, reason: "unsupported_herdr_response", strict: false };
+}
+function wakeSeedFromMessage(input) {
+  return buildWakeSeed(input);
+}
+function parseWakeStrict(raw) {
+  return raw === "herdr" ? "herdr" : null;
+}
+async function auditHerdrWakeSuccess(deps, session, detail) {
+  try {
+    await deps.audit?.append({
+      timestamp: deps.now?.() ?? Date.now(),
+      kind: "agent_wake_succeeded",
+      agent: session.agent,
+      session: session.session_id,
+      conversation_id: deps.conversationId,
+      detail: {
+        strategy: "herdr",
+        ...detail
+      }
+    });
+  } catch {
+  }
+}
+async function auditWakeDeliveryFailure(deps, input) {
+  try {
+    await deps.audit?.append({
+      timestamp: deps.now?.() ?? Date.now(),
+      kind: "wake_delivery_failure",
+      agent: input.session.agent,
+      session: input.session.session_id,
+      detail: {
+        reason: input.reason,
+        strategy: input.strategy,
+        path: input.path,
+        ...input.detail
+      }
+    });
+  } catch {
+  }
+}
+async function wakeStrategyForSession(storage, session) {
+  const mode = await resolveWakeMode(storage, session.project, session.agent);
+  return effectiveWakeStrategy(session, mode);
+}
+function validateHerdrRegisterParams(params, expectedAgent) {
+  if (params.herdr_identity === void 0) {
+    return { ok: true };
+  }
+  const identity = parseHerdrIdentity(params.herdr_identity);
+  if (!identity || identity.agent !== expectedAgent) {
+    return { ok: false, reason: "invalid herdr_identity" };
+  }
+  return { ok: true };
+}
+async function applyHerdrWakeTargetFromRegisterParams(storage, session, params, expectedAgent, sessionOwnerIsLive) {
+  const validated = validateHerdrRegisterParams(params, expectedAgent);
+  if (!validated.ok) return;
+  const herdrIdentity = parseHerdrIdentity(params.herdr_identity);
+  const wakeStrict = parseWakeStrict(params.wake_strict);
+  const liveness = sessionOwnerIsLive ?? createSessionOwnerLiveness();
+  if (params.herdr_identity !== void 0 && herdrIdentity) {
+    await storage.setSessionWakeTarget(
+      session,
+      herdrIdentity,
+      params.wake_strict !== void 0 ? wakeStrict : void 0
+    );
+    const row = await storage.getSession(session);
+    if (row?.wake_identity) {
+      await supersedeStaleSessionsOnHerdrRegister(storage, row, liveness);
+    }
+  } else if (params.wake_strict !== void 0) {
+    await storage.setSessionWakeTarget(session, void 0, wakeStrict);
+  }
+}
+
+// ../core-daemon/runtime/ensure-registration.ts
+function registrationBase(registration) {
+  return {
+    registration_id: registration.registration_id,
+    comm: registration.comm,
+    account_id: registration.bot_user_id
+  };
+}
+async function ensureRegistrationForAccount(registration, input) {
+  const base = registrationBase(registration);
+  let factory = input.factories.find((candidate) => candidate.commId === registration.comm);
+  let rescanned = false;
+  if (!factory && input.rescanFactories) {
+    factory = await input.rescanFactories(registration.comm);
+    rescanned = true;
+  }
+  if (!factory) {
+    const reason = "no_comm_factory";
+    console.error(
+      `agents-comm-bus: ensureRegistration ${registration.registration_id}: no comm adapter factory for "${registration.comm}" after on-demand re-scan (project=${registration.project}, agent=${registration.agent}, bot=${registration.bot_user_id}) \u2014 skipping adapter`
+    );
+    await input.audit?.append({
+      timestamp: Date.now(),
+      kind: "comm_adapter_skip",
+      agent: registration.agent,
+      detail: {
+        comm: registration.comm,
+        account_id: registration.bot_user_id,
+        account_label: registration.account_label,
+        project: registration.project,
+        reason,
+        rescanned,
+        via: "ensure_registration",
+        registration_id: registration.registration_id
+      }
+    }).catch(() => {
+    });
+    return {
+      status: "no-factory",
+      ...base,
+      rescanned,
+      retryClass: "permanent",
+      reason
+    };
+  }
+  const accountId = registration.bot_user_id;
+  const key = adapterMapKey(registration.comm, accountId);
+  if (input.agentLeaseProperties) {
+    input.leaseArbiter.setDesiredAgentProperties(
+      registration.comm,
+      registration.bot_user_id,
+      input.agentLeaseProperties
+    );
+  }
+  if (input.bus.getComm(registration.comm, accountId)) {
+    if (input.agentLeaseProperties) {
+      await input.leaseArbiter.syncAgentProperties(registration.comm, registration.bot_user_id);
+    }
+    return { status: "already-live", ...base, retryClass: "success" };
+  }
+  if (input.inFlight.has(key)) {
+    if (input.agentLeaseProperties) {
+      await input.leaseArbiter.syncAgentProperties(registration.comm, registration.bot_user_id);
+    }
+    return { status: "in-flight", ...base, retryClass: "success" };
+  }
+  input.inFlight.add(key);
+  try {
+    const result = await addAdapterForRegistration({
+      factory,
+      registration,
+      bus: input.bus,
+      bridges: input.bridges,
+      env: input.env,
+      blobs: input.blobs,
+      stateRoot: input.stateRoot,
+      storage: input.storage,
+      leaseArbiter: input.leaseArbiter,
+      discoveryRoot: input.discoveryRoot,
+      sessionOwnerIsLive: input.sessionOwnerIsLive
+    });
+    if (result.ok) {
+      if (input.agentLeaseProperties) {
+        await input.leaseArbiter.syncAgentProperties(registration.comm, registration.bot_user_id);
+      }
+      return { status: "started", ...base, retryClass: "success" };
+    }
+    if (result.retryClass === "permanent") {
+      if (result.resolution.status === "invalid") {
+        logInvalidCredentialResolution(registration, factory.commId, result.resolution);
+        await appendCredentialResolutionFailedAudit(
+          input.audit,
+          registration,
+          factory.commId,
+          result.resolution
+        );
+      } else {
+        console.error(
+          `agents-comm-bus: ensureRegistration could not start ${key}: ${result.reason}`
+        );
+        await input.audit?.append({
+          timestamp: Date.now(),
+          kind: "comm_adapter_skip",
+          agent: registration.agent,
+          detail: {
+            comm: registration.comm,
+            account_id: registration.bot_user_id,
+            account_label: registration.account_label,
+            project: registration.project,
+            reason: result.reason,
+            via: "ensure_registration",
+            registration_id: registration.registration_id
+          }
+        }).catch(() => {
+        });
+      }
+      return {
+        status: "invalid-credentials",
+        ...base,
+        reason: result.reason,
+        retryClass: "permanent",
+        resolution: result.resolution
+      };
+    }
+    if (result.resolution) {
+      console.error(
+        `agents-comm-bus: ensureRegistration could not start ${key}: ${result.reason}`
+      );
+      await input.audit?.append({
+        timestamp: Date.now(),
+        kind: "comm_adapter_skip",
+        agent: registration.agent,
+        detail: {
+          comm: registration.comm,
+          account_id: registration.bot_user_id,
+          account_label: registration.account_label,
+          project: registration.project,
+          reason: result.reason,
+          via: "ensure_registration",
+          registration_id: registration.registration_id
+        }
+      }).catch(() => {
+      });
+      if (registration.activation === "eager" && input.scheduleEagerRetry) {
+        input.scheduleEagerRetry(registration.registration_id);
+      }
+      return {
+        status: "start-failed",
+        ...base,
+        reason: result.reason,
+        retryClass: "transient",
+        resolution: result.resolution
+      };
+    }
+    console.error(
+      `agents-comm-bus: ensureRegistration construction failed ${key}: ${result.reason}`
+    );
+    if (registration.activation === "eager" && input.scheduleEagerRetry) {
+      input.scheduleEagerRetry(registration.registration_id);
+    }
+    return {
+      status: "construction-failed",
+      ...base,
+      reason: result.reason,
+      retryClass: "transient"
+    };
+  } finally {
+    input.inFlight.delete(key);
+  }
+}
+async function ensureRegistrationById(registration_id, input) {
+  const registration = await input.storage.getAccountByRegistrationId(registration_id);
+  if (!registration) return null;
+  return ensureRegistrationForAccount(registration, input);
+}
+async function reconcileEagerRegistrations(input) {
+  const registrations = await input.storage.listAccountRegistrations();
+  const eager = registrations.filter((row) => row.activation === "eager");
+  const outcomes = [];
+  for (const registration of eager) {
+    try {
+      outcomes.push(await ensureRegistrationForAccount(registration, input.ensure));
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error(
+        `agents-comm-bus: eager reconcile failed for ${registration.registration_id}: ${reason}`
+      );
+    }
+  }
+  return outcomes;
+}
+
+// ../core-daemon/runtime/eager-activation-retry.ts
+var INITIAL_RETRY_MS = 1e3;
+var MAX_RETRY_MS = 3e4;
+var MAX_RETRY_ATTEMPTS = 5;
+function createEagerActivationRetryScheduler(input) {
+  const setTimeoutFn = input.setTimeoutFn ?? setTimeout;
+  const clearTimeoutFn = input.clearTimeoutFn ?? clearTimeout;
+  const timers = /* @__PURE__ */ new Map();
+  const attempts = /* @__PURE__ */ new Map();
+  let stopped = false;
+  const clearTimer = (registration_id) => {
+    const timer = timers.get(registration_id);
+    if (timer !== void 0) clearTimeoutFn(timer);
+    timers.delete(registration_id);
+  };
+  const cancel = (registration_id) => {
+    clearTimer(registration_id);
+    attempts.delete(registration_id);
+  };
+  const stopAll = () => {
+    stopped = true;
+    for (const timer of timers.values()) {
+      clearTimeoutFn(timer);
+    }
+    timers.clear();
+    attempts.clear();
+  };
+  const schedule = (registration_id) => {
+    if (stopped) return;
+    const prior = attempts.get(registration_id) ?? 0;
+    if (prior >= MAX_RETRY_ATTEMPTS) return;
+    const attempt = prior + 1;
+    attempts.set(registration_id, attempt);
+    const delayMs = Math.min(INITIAL_RETRY_MS * 2 ** (attempt - 1), MAX_RETRY_MS);
+    clearTimer(registration_id);
+    const timer = setTimeoutFn(() => {
+      timers.delete(registration_id);
+      void (async () => {
+        if (stopped) return;
+        const row = await input.storage.getAccountByRegistrationId(registration_id);
+        if (!row || row.activation !== "eager") {
+          cancel(registration_id);
+          return;
+        }
+        const outcome = await ensureRegistrationById(registration_id, {
+          ...input.ensure,
+          scheduleEagerRetry: void 0
+        });
+        if (stopped) return;
+        if (!outcome || outcome.retryClass !== "transient") {
+          cancel(registration_id);
+          return;
+        }
+        schedule(registration_id);
+      })().catch((error) => {
+        console.error(
+          `agents-comm-bus: eager retry failed for ${registration_id}: ${error instanceof Error ? error.message : String(error)}`
+        );
+      });
+    }, delayMs);
+    if (timer && typeof timer === "object" && "unref" in timer) {
+      timer.unref?.();
+    }
+    timers.set(registration_id, timer);
+  };
+  return { schedule, cancel, stopAll };
+}
 
 // ../core-daemon/runtime/register-comm-ipc-methods.ts
 var DuplicateCommIpcMethodError = class extends Error {
@@ -7168,6 +10270,57 @@ function createCommFactoryRegistry(input) {
     },
     rescanFactoriesForComm
   };
+}
+
+// ../core-daemon/runtime/dispatch-inbound.ts
+async function dispatchInboundToBridges(bridges, conversation, message, audit, pendingInbound) {
+  for (const bridge of bridges) {
+    if (bridge.agentId !== conversation.agent) continue;
+    if (!bridge.onInboundConversation) continue;
+    try {
+      await audit.append({
+        timestamp: Date.now(),
+        kind: "inbound_dispatch_bridge_invoked",
+        agent: bridge.agentId,
+        conversation_id: conversation.conversation_id,
+        detail: {
+          conversation_agent: conversation.agent,
+          platform_message_id: message.platform_message_id,
+          message_id: message.message_id,
+          queue_length: pendingInbound.length
+        }
+      });
+      await bridge.onInboundConversation(conversation, message);
+      await audit.append({
+        timestamp: Date.now(),
+        kind: "inbound_dispatch_bridge_completed",
+        agent: bridge.agentId,
+        conversation_id: conversation.conversation_id,
+        detail: {
+          conversation_agent: conversation.agent,
+          platform_message_id: message.platform_message_id,
+          message_id: message.message_id,
+          queue_length: pendingInbound.length
+        }
+      });
+    } catch (error) {
+      await audit.append({
+        timestamp: Date.now(),
+        kind: "inbound_dispatch_bridge_failed",
+        agent: bridge.agentId,
+        conversation_id: conversation.conversation_id,
+        detail: {
+          conversation_agent: conversation.agent,
+          platform_message_id: message.platform_message_id,
+          message_id: message.message_id,
+          error: error instanceof Error ? error.message : String(error)
+        }
+      });
+      console.error(
+        `agents-comm-bus: bridge ${bridge.agentId} onInboundConversation failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
 }
 
 // ../core-daemon/runtime/daemon-idle-reaper.ts
@@ -7280,111 +10433,349 @@ function startIdleReaper(options) {
   };
 }
 
-// ../core-daemon/runtime/session-end-sweep.ts
-var DEFAULT_SESSION_END_SWEEP_INTERVAL_MS = 60 * 60 * 1e3;
-function sessionEndObservation(session) {
-  return {
-    status: session.status,
-    lease_holder_connection_id: session.lease_holder_connection_id,
-    lease_owner_process_pid: session.lease_owner_process_pid,
-    lease_owner_process_registered_at: session.lease_owner_process_registered_at
-  };
-}
-function shouldSweepEndSession(session, options = {}) {
-  const ownerState = classifySessionOwnerProcess(session, options);
-  if (ownerState === "live" || ownerState === "stale") return false;
-  if (ownerState === "no_owner") {
-    return session.lease_holder_connection_id == null;
+// ../core-daemon/runtime/comm-lease-sweep.ts
+import { constants as constants2, existsSync as existsSync2 } from "node:fs";
+import { mkdir as mkdir7, open as open4, readdir, readFile as readFile7, rm as rm5, stat as stat5 } from "node:fs/promises";
+import os3 from "node:os";
+import path7 from "node:path";
+var DEFAULT_COMM_LEASE_SWEEP_INTERVAL_MS = 60 * 60 * 1e3;
+function classifyCommLeaseOwner(record, options = {}) {
+  const isPidAlive2 = options.isPidAlive ?? defaultIsPidAlive2;
+  if (!Number.isInteger(record.pid) || record.pid <= 0 || !isPidAlive2(record.pid)) {
+    return "definitely_dead";
   }
+  if (record.process_start_time != null) {
+    const compare = options.readProcessStartEpochMs ? (() => {
+      const current = options.readProcessStartEpochMs(record.pid);
+      if (current == null) return "inconclusive";
+      return current === record.process_start_time ? "match" : "mismatch";
+    })() : compareProcessStartIdentity(record.process_start_time, record.pid, options);
+    if (compare === "mismatch") return "definitely_dead";
+  }
+  return "retain";
+}
+function commLeaseLockRoot(homeDir = os3.homedir()) {
+  return path7.join(homeDir, `.${DAEMON_NAME}`, "comm-locks");
+}
+function isAlreadyExistsError4(error) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+}
+function parseLeaseRecord(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.pid !== "number" || typeof parsed.comm_id !== "string") return null;
+    if (typeof parsed.resource_id !== "string") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+async function acquireSweepGuard(leasePath, selfPid, now, isPidAlive2, stalenessMs) {
+  const guardPath = `${leasePath}.guard`;
+  await mkdir7(path7.dirname(guardPath), { recursive: true });
+  const token = `${selfPid}:${now()}`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await open4(guardPath, constants2.O_CREAT | constants2.O_EXCL | constants2.O_WRONLY);
+      await handle.writeFile(`${token}
+`, "utf8");
+      await handle.close();
+      return token;
+    } catch (error) {
+      if (!isAlreadyExistsError4(error)) throw error;
+      if (attempt === 0 && await guardIsStale(guardPath, selfPid, now, isPidAlive2, stalenessMs)) {
+        await rm5(guardPath, { force: true });
+        continue;
+      }
+      return null;
+    }
+  }
+  return null;
+}
+async function guardIsStale(guardPath, selfPid, now, isPidAlive2, stalenessMs) {
+  try {
+    const raw = (await readFile7(guardPath, "utf8")).trim();
+    const pid = Number(raw.split(":")[0]);
+    if (!Number.isInteger(pid) || pid <= 0) return true;
+    if (pid === selfPid) return false;
+    return !isPidAlive2(pid);
+  } catch {
+    try {
+      const info = await stat5(guardPath);
+      return now() - info.mtimeMs > stalenessMs;
+    } catch {
+      return false;
+    }
+  }
+}
+async function releaseSweepGuard(leasePath, token) {
+  const guardPath = `${leasePath}.guard`;
+  try {
+    const current = (await readFile7(guardPath, "utf8")).trim();
+    if (current === token) {
+      await rm5(guardPath, { force: true });
+    }
+  } catch {
+  }
+}
+function isCommLeaseRecoveryAllowed(recoveryAllowed) {
+  return recoveryAllowed?.() ?? true;
+}
+async function recoverAfterLeaseDeletion(comm_id, resource_id, input) {
+  if (nudgeLeaseReacquire(comm_id, resource_id)) {
+    return true;
+  }
+  const registrations = await input.storage.listAccountRegistrations({
+    comm: comm_id
+  });
+  const registration = registrations.find((row) => row.bot_user_id === resource_id);
+  if (!registration || !await isRegistrationDesiredForRecovery(registration, input)) {
+    return false;
+  }
+  await ensureRegistrationForAccount(registration, input.ensure);
   return true;
 }
-async function runSessionEndSweep(input) {
+async function isRegistrationDesiredForRecovery(registration, input) {
+  if (registration.activation === "eager") return true;
+  if (!input.discoveryRoot || !input.sessionOwnerIsLive || !input.factories?.length) {
+    return false;
+  }
+  const desired = await buildGlobalDesiredRegistrationIds({
+    storage: input.storage,
+    factories: [...input.factories],
+    discoveryRoot: input.discoveryRoot,
+    sessionOwnerIsLive: input.sessionOwnerIsLive
+  });
+  return desired.has(registration.registration_id);
+}
+async function runCommLeaseSweep(input) {
   const counts = {
-    ended: 0,
-    kept_live: 0,
-    kept_stale: 0,
-    kept_no_owner_leased: 0,
-    cas_lost: 0
+    examined: 0,
+    retained: 0,
+    reaped: 0,
+    cas_lost: 0,
+    guard_contended: 0,
+    malformed: 0,
+    recovered: 0
   };
+  const homeDir = input.homeDir ?? os3.homedir();
+  const selfPid = input.selfPid ?? process.pid;
+  const now = input.now ?? Date.now;
+  const isPidAlive2 = input.isPidAlive ?? input.ownerLivenessOptions?.isPidAlive ?? defaultIsPidAlive2;
   const livenessOptions = {
-    now: input.now,
-    isPidAlive: input.isPidAlive,
-    recencyMs: input.recencyMs
+    ...input.ownerLivenessOptions,
+    isPidAlive: isPidAlive2
   };
-  const at = (input.now ?? Date.now)();
-  const sessions = await input.storage.listSessions({ status: "active" });
-  for (const session of sessions) {
-    const ownerState = classifySessionOwnerProcess(session, livenessOptions);
-    if (!shouldSweepEndSession(session, livenessOptions)) {
-      if (ownerState === "live") counts.kept_live += 1;
-      else if (ownerState === "stale") counts.kept_stale += 1;
-      else if (ownerState === "no_owner" && session.lease_holder_connection_id != null) {
-        counts.kept_no_owner_leased += 1;
-      }
+  const stalenessMs = input.stalenessMs ?? 9e4;
+  const root = commLeaseLockRoot(homeDir);
+  if (!existsSync2(root)) {
+    return counts;
+  }
+  let commDirs;
+  try {
+    commDirs = await readdir(root);
+  } catch (error) {
+    throw new Error(
+      `comm lease sweep: unreadable lock root ${root}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  for (const commId of commDirs) {
+    const commDir = path7.join(root, commId);
+    let entries;
+    try {
+      const info = await stat5(commDir);
+      if (!info.isDirectory()) continue;
+      entries = await readdir(commDir);
+    } catch {
       continue;
     }
-    const ended = await input.storage.endSessionIfUnchanged(
-      session.session_id,
-      sessionEndObservation(session),
-      at
-    );
-    if (ended) counts.ended += 1;
-    else counts.cas_lost += 1;
+    if (input.prefetchIdentities) {
+      const pids = [];
+      for (const entry of entries.filter((name) => name.endsWith(".json"))) {
+        try {
+          const record = parseLeaseRecord(await readFile7(path7.join(commDir, entry), "utf8"));
+          if (record) pids.push(record.pid);
+        } catch {
+        }
+      }
+      await input.prefetchIdentities(pids);
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith(".json") || entry.endsWith(".json.guard")) continue;
+      if (entry.endsWith(".guard")) continue;
+      const leasePath = path7.join(commDir, entry);
+      counts.examined += 1;
+      let snapshot;
+      try {
+        snapshot = await readFile7(leasePath, "utf8");
+      } catch {
+        counts.malformed += 1;
+        continue;
+      }
+      const record = parseLeaseRecord(snapshot);
+      if (!record) {
+        counts.malformed += 1;
+        continue;
+      }
+      if (classifyCommLeaseOwner(record, livenessOptions) !== "definitely_dead") {
+        counts.retained += 1;
+        continue;
+      }
+      const guard = await acquireSweepGuard(leasePath, selfPid, now, isPidAlive2, stalenessMs);
+      if (!guard) {
+        counts.guard_contended += 1;
+        continue;
+      }
+      let reaped = null;
+      try {
+        if (input.afterGuardAcquired) {
+          await input.afterGuardAcquired(leasePath, snapshot);
+        }
+        let reread;
+        try {
+          reread = await readFile7(leasePath, "utf8");
+        } catch {
+          counts.cas_lost += 1;
+          continue;
+        }
+        if (reread !== snapshot) {
+          counts.cas_lost += 1;
+          continue;
+        }
+        const current = parseLeaseRecord(reread);
+        if (!current || classifyCommLeaseOwner(current, livenessOptions) !== "definitely_dead") {
+          counts.cas_lost += 1;
+          continue;
+        }
+        await rm5(leasePath, { force: true });
+        counts.reaped += 1;
+        await input.audit?.append({
+          timestamp: now(),
+          kind: "comm_lease_reaped",
+          detail: {
+            comm_id: current.comm_id,
+            resource_id: current.resource_id,
+            holder_pid: current.pid,
+            holder_rank: current.authorityRank,
+            process_start_time: current.process_start_time ?? null
+          }
+        }).catch(() => {
+        });
+        reaped = {
+          comm_id: current.comm_id,
+          resource_id: current.resource_id
+        };
+      } finally {
+        await releaseSweepGuard(leasePath, guard);
+      }
+      if (reaped && input.recovery) {
+        if (input.beforeRecovery) {
+          await input.beforeRecovery(leasePath);
+        }
+        if (!isCommLeaseRecoveryAllowed(input.recoveryAllowed)) {
+          continue;
+        }
+        const recovered = await recoverAfterLeaseDeletion(
+          reaped.comm_id,
+          reaped.resource_id,
+          input.recovery
+        ).catch(() => false);
+        if (recovered) counts.recovered += 1;
+      }
+    }
+  }
+  if (input.sweepHold) {
+    await input.sweepHold();
   }
   const log = input.log ?? (() => {
   });
   log(
-    `agents-comm-bus: session end sweep: ended=${counts.ended} kept_live=${counts.kept_live} kept_stale=${counts.kept_stale} kept_no_owner_leased=${counts.kept_no_owner_leased} cas_lost=${counts.cas_lost}`
+    `agents-comm-bus: comm lease sweep: examined=${counts.examined} retained=${counts.retained} reaped=${counts.reaped} cas_lost=${counts.cas_lost} guard_contended=${counts.guard_contended} malformed=${counts.malformed} recovered=${counts.recovered}`
   );
   return counts;
 }
-function startSessionEndSweep(options) {
-  const intervalMs = options.intervalMs ?? DEFAULT_SESSION_END_SWEEP_INTERVAL_MS;
+function startCommLeaseSweep(options) {
+  const intervalMs = options.intervalMs ?? DEFAULT_COMM_LEASE_SWEEP_INTERVAL_MS;
   const setIntervalFn = options.setIntervalFn ?? ((fn, ms) => {
     const handle = setInterval(fn, ms);
     handle.unref?.();
     return handle;
   });
   const clearIntervalFn = options.clearIntervalFn ?? ((h) => clearInterval(h));
-  const setTimeoutFn = options.setTimeoutFn ?? ((fn, ms) => {
-    const handle = setTimeout(fn, ms);
-    handle.unref?.();
-    return handle;
-  });
-  const clearTimeoutFn = options.clearTimeoutFn ?? ((h) => clearTimeout(h));
   let sweepInFlight = false;
+  let pendingTick = false;
+  let stopped = false;
   let interval = null;
   const tick = () => {
-    if (sweepInFlight) return;
+    if (stopped) return;
+    if (sweepInFlight) {
+      pendingTick = true;
+      return;
+    }
     sweepInFlight = true;
-    void runSessionEndSweep({
-      storage: options.storage,
+    void runCommLeaseSweep({
+      prefetchIdentities: options.prefetchIdentities,
+      homeDir: options.homeDir,
+      selfPid: options.selfPid,
       now: options.now,
       isPidAlive: options.isPidAlive,
-      recencyMs: options.recencyMs,
-      log: options.log
-    }).catch((error) => {
+      ownerLivenessOptions: options.ownerLivenessOptions,
+      stalenessMs: options.stalenessMs,
+      log: options.log,
+      audit: options.audit,
+      recovery: options.recovery,
+      sweepHold: options.sweepHold,
+      afterGuardAcquired: options.afterGuardAcquired,
+      beforeRecovery: options.beforeRecovery,
+      recoveryAllowed: options.recoveryAllowed ?? (() => !stopped)
+    }).catch(async (error) => {
       const log = options.log ?? console.error;
-      log(
-        `agents-comm-bus: session end sweep failed: ${error instanceof Error ? error.message : String(error)}`
-      );
+      const reason = error instanceof Error ? error.message : String(error);
+      log(`agents-comm-bus: comm lease sweep failed: ${reason}`);
+      await options.audit?.append({
+        timestamp: (options.now ?? Date.now)(),
+        kind: "comm_lease_sweep_failed",
+        detail: { phase: "periodic", reason }
+      }).catch(() => {
+      });
     }).finally(() => {
       sweepInFlight = false;
+      if (!stopped && pendingTick) {
+        pendingTick = false;
+        tick();
+      }
     });
   };
   if (options.runOnStart !== false) {
     tick();
   }
-  const initial = setTimeoutFn(() => {
-    interval = setIntervalFn(tick, intervalMs);
-  }, intervalMs);
+  interval = setIntervalFn(tick, intervalMs);
   return {
     stop() {
-      clearTimeoutFn(initial);
+      stopped = true;
       if (interval != null) clearIntervalFn(interval);
       interval = null;
     }
   };
+}
+async function runCommLeaseDaemonBootstrap(input) {
+  let periodic = null;
+  try {
+    await input.bootSweep();
+    periodic = input.startPeriodicSweep();
+  } catch (error) {
+    await input.onBootSweepFailed(error);
+  }
+  await input.bootRestore();
+  await input.eagerReconcile();
+  return periodic;
+}
+function publishCommLeaseSweepHandle(input) {
+  if (input.retiring) {
+    input.incoming?.stop();
+    return { current: input.current, stoppedIncoming: input.incoming != null };
+  }
+  return { current: input.incoming, stoppedIncoming: false };
 }
 
 // ../core-daemon/runtime/durable-inbound.ts
@@ -7532,14 +10923,16 @@ async function runDaemon(options) {
     console.log(JSON.stringify({ ...paths, discovery: discoveryPaths }, null, 2));
     return;
   }
-  await mkdir6(paths.root, { recursive: true });
-  await mkdir6(discoveryPaths.root, { recursive: true });
+  await mkdir8(paths.root, { recursive: true });
+  await mkdir8(discoveryPaths.root, { recursive: true });
   const storage = await openSqliteStorage(paths.database);
   const transcripts = new JsonlTranscriptStore(paths.root);
   const audit = new JsonlAuditStore(paths.root);
   const blobs = new ContentAddressedBlobStore(paths.root);
   const pendingInbound = [];
   const sessionOwnerIsLive = createSessionOwnerLiveness();
+  const scopeReconcileState = { zeroLiveSince: /* @__PURE__ */ new Map() };
+  let requestScopeReconcile;
   const daemonBin = env.AGENTS_COMM_BUS_BIN ?? process.argv[1] ?? null;
   const { authorityRank, checkoutRoot } = inferAuthorityRank({
     env,
@@ -7567,7 +10960,7 @@ async function runDaemon(options) {
     }
   });
   console.error(
-    `agents-comm-bus ${DAEMON_VERSION} starting: stateRoot=${paths.root} discoveryRoot=${discoveryPaths.root} checkoutRoot=${checkoutRoot ?? "?"} daemonBin=${daemonBin ?? "?"} authorityRank=${authorityRank} pid=${process.pid} home=${os3.homedir()}`
+    `agents-comm-bus ${DAEMON_VERSION} starting: stateRoot=${paths.root} discoveryRoot=${discoveryPaths.root} checkoutRoot=${checkoutRoot ?? "?"} daemonBin=${daemonBin ?? "?"} authorityRank=${authorityRank} pid=${process.pid} home=${os4.homedir()}`
   );
   const comms = [];
   const bus = new MessageBus({
@@ -7579,6 +10972,13 @@ async function runDaemon(options) {
     comms,
     sessionOwnerIsLive
   });
+  const daemonSelfIdentity = {
+    discoveryRoot: discoveryPaths.root,
+    checkoutRoot,
+    stateRoot: paths.root,
+    daemonBin,
+    authorityRank
+  };
   const bridges = [];
   const inFlightAdapters = /* @__PURE__ */ new Set();
   const activeScopes = /* @__PURE__ */ new Set();
@@ -7602,15 +11002,40 @@ async function runDaemon(options) {
       registerCommIpcMethods(ipcMethods, factory, ipcDeps, { commIdByMethod });
     }
   }
-  const ensureCommsForSessionFn = async (project, agent, options2) => {
+  const buildEnsureRegistrationContext = (options2) => ({
+    factories: commAdapterFactories,
+    rescanFactories: rescanFactoriesForComm,
+    bus,
+    bridges,
+    storage,
+    env,
+    blobs,
+    stateRoot: paths.root,
+    leaseArbiter,
+    inFlight: inFlightAdapters,
+    audit,
+    discoveryRoot: discoveryPaths.root,
+    sessionOwnerIsLive,
+    ...options2
+  });
+  let eagerRetry;
+  const scheduleEagerRetry = (registration_id) => {
+    eagerRetry?.schedule(registration_id);
+  };
+  eagerRetry = createEagerActivationRetryScheduler({
+    storage,
+    ensure: buildEnsureRegistrationContext({ scheduleEagerRetry })
+  });
+  const ensureCommsForSessionWithOutcomes = async (project, agent, options2) => {
     const canonicalProject = normalizeProjectPath(project);
     const accountLabelScope = options2?.accountLabelScope ?? null;
     activeScopes.add(scopeKey(agent, canonicalProject, accountLabelScope));
-    await ensureCommsForSession({
+    const { outcomes } = await ensureCommsForSession({
       project: canonicalProject,
       requestedProject: project,
       agent,
       accountLabelScope,
+      agentLeaseProperties: options2?.agentLeaseProperties,
       factories: commAdapterFactories,
       rescanFactories: rescanFactoriesForComm,
       bus,
@@ -7621,8 +11046,15 @@ async function runDaemon(options) {
       stateRoot: paths.root,
       leaseArbiter,
       inFlight: inFlightAdapters,
-      audit
+      audit,
+      discoveryRoot: discoveryPaths.root,
+      sessionOwnerIsLive
     });
+    return outcomes;
+  };
+  const ensureCommsForSessionFn = async (project, agent, options2) => {
+    const canonicalProject = normalizeProjectPath(project);
+    const outcomes = await ensureCommsForSessionWithOutcomes(project, agent, options2);
     await rehydratePendingInboundForScope({
       storage,
       transcripts,
@@ -7631,6 +11063,7 @@ async function runDaemon(options) {
       project: canonicalProject,
       agent
     });
+    return { rehydrated: true, outcomes };
   };
   bridges.push(
     ...options.agentBridgeFactories.map(
@@ -7640,14 +11073,11 @@ async function runDaemon(options) {
         audit,
         pendingInbound,
         ensureCommsForSession: ensureCommsForSessionFn,
-        daemonOwner: {
-          discoveryRoot: discoveryPaths.root,
-          checkoutRoot,
-          stateRoot: paths.root,
-          daemonBin,
-          authorityRank
-        },
-        sessionOwnerIsLive
+        daemonOwner: daemonSelfIdentity,
+        sessionOwnerIsLive,
+        readHeldCommLease: (commId, resourceId) => leaseArbiter.readHeldCommLease(commId, resourceId),
+        persistHeldCommLeaseAgentProperties: (commId, resourceId, agentProperties) => leaseArbiter.persistAgentPropertiesIfHeld(commId, resourceId, agentProperties),
+        requestScopeReconcile: () => requestScopeReconcile?.()
       })
     )
   );
@@ -7692,53 +11122,13 @@ async function runDaemon(options) {
           queue_length: pendingInbound.length
         }
       });
-      for (const bridge of bridges) {
-        if (bridge.onInboundConversation) {
-          try {
-            await audit.append({
-              timestamp: Date.now(),
-              kind: "inbound_dispatch_bridge_invoked",
-              agent: bridge.agentId,
-              conversation_id: conversation.conversation_id,
-              detail: {
-                conversation_agent: conversation.agent,
-                platform_message_id: message.platform_message_id,
-                message_id: message.message_id,
-                queue_length: pendingInbound.length
-              }
-            });
-            await bridge.onInboundConversation(conversation, message);
-            await audit.append({
-              timestamp: Date.now(),
-              kind: "inbound_dispatch_bridge_completed",
-              agent: bridge.agentId,
-              conversation_id: conversation.conversation_id,
-              detail: {
-                conversation_agent: conversation.agent,
-                platform_message_id: message.platform_message_id,
-                message_id: message.message_id,
-                queue_length: pendingInbound.length
-              }
-            });
-          } catch (error) {
-            await audit.append({
-              timestamp: Date.now(),
-              kind: "inbound_dispatch_bridge_failed",
-              agent: bridge.agentId,
-              conversation_id: conversation.conversation_id,
-              detail: {
-                conversation_agent: conversation.agent,
-                platform_message_id: message.platform_message_id,
-                message_id: message.message_id,
-                error: error instanceof Error ? error.message : String(error)
-              }
-            });
-            console.error(
-              `agents-comm-bus: bridge ${bridge.agentId} onInboundConversation failed: ${error instanceof Error ? error.message : String(error)}`
-            );
-          }
-        }
-      }
+      await dispatchInboundToBridges(
+        bridges,
+        conversation,
+        message,
+        audit,
+        pendingInbound
+      );
     }
   });
   for (const bridge of bridges) {
@@ -7768,7 +11158,10 @@ async function runDaemon(options) {
     stateRoot: paths.root,
     leaseArbiter,
     activeScopes,
+    discoveryRoot: discoveryPaths.root,
+    sessionOwnerIsLive,
     audit,
+    ensureRegistrationContext: buildEnsureRegistrationContext({ scheduleEagerRetry }),
     options: reloadOptions
   });
   const server = await startIpcServer({
@@ -7786,7 +11179,11 @@ async function runDaemon(options) {
         reloadRegistrations,
         ensureCommsForSession: ensureCommsForSessionFn,
         pendingInbound,
-        activeScopes
+        activeScopes,
+        storage,
+        bridges,
+        daemonOwner: daemonSelfIdentity,
+        sessionOwnerIsLive
       });
     }
   });
@@ -7798,9 +11195,28 @@ async function runDaemon(options) {
     });
   } catch (error) {
     await server.close();
+    if (error instanceof DiscoveryClaimLostError) {
+      await audit.append({
+        timestamp: Date.now(),
+        kind: "daemon_claim_lost",
+        detail: {
+          winner_pid: error.winner.pid,
+          winner_port: error.winner.port,
+          winner_state_root: error.winner.stateRoot
+        }
+      }).catch(() => {
+      });
+      await storage.close().catch(() => {
+      });
+      (options.exitProcess ?? ((code) => process.exit(code)))(0);
+      return;
+    }
     throw error;
   }
   await bus.start();
+  await prefetchProcessStartIdentity([process.pid]);
+  void storage.listSessions({ status: "active" }).then((sessions) => prefetchProcessStartIdentity([process.pid, ...sessions.flatMap((session) => session.lease_owner_process_pid == null ? [] : [session.lease_owner_process_pid])])).catch(() => {
+  });
   const collectBridgeBlockers = () => {
     const blockers = {};
     for (const bridge of bridges) {
@@ -7811,7 +11227,10 @@ async function runDaemon(options) {
   let pidWatchdogHandle = null;
   let idleReaperHandle = null;
   let sessionEndSweepHandle = null;
+  let commLeaseSweepHandle = null;
+  let daemonRetiring = false;
   const runDaemonRetirement = async (reason, recordAudit) => {
+    daemonRetiring = true;
     await retireDaemon({
       reason,
       port: server.port,
@@ -7822,6 +11241,9 @@ async function runDaemon(options) {
         pidWatchdogHandle?.stop();
         idleReaperHandle?.stop();
         sessionEndSweepHandle?.stop();
+        commLeaseSweepHandle?.stop();
+        commLeaseSweepHandle = null;
+        eagerRetry?.stopAll();
       },
       stopBus: () => bestEffortWithTimeout(
         () => bus.stop(),
@@ -7859,15 +11281,79 @@ async function runDaemon(options) {
     log: (message) => console.error(message)
   });
   sessionEndSweepHandle = startSessionEndSweep({
+    prefetchIdentities: prefetchProcessStartIdentity,
     storage,
-    log: (message) => console.error(message)
+    log: (message) => console.error(message),
+    reconcile: {
+      storage,
+      bus,
+      bridges,
+      factories: commAdapterFactories,
+      activeScopes,
+      leaseArbiter,
+      sessionOwnerIsLive,
+      removeAdapter: removeLiveAdapter,
+      state: scopeReconcileState,
+      discoveryRoot: discoveryPaths.root
+    },
+    reconcileState: scopeReconcileState
   });
-  void runBootScopeRestore({
-    stateRoot: paths.root,
-    discoveryRoot: discoveryPaths.root,
+  requestScopeReconcile = () => sessionEndSweepHandle?.requestEarlyReconcile();
+  const commLeaseSweepRecovery = {
     storage,
-    ensureCommsForSession: ensureCommsForSessionFn,
-    audit
+    ensure: buildEnsureRegistrationContext({ scheduleEagerRetry }),
+    audit,
+    discoveryRoot: discoveryPaths.root,
+    sessionOwnerIsLive,
+    factories: commAdapterFactories
+  };
+  void runCommLeaseDaemonBootstrap({
+    bootSweep: () => runCommLeaseSweep({
+      prefetchIdentities: prefetchProcessStartIdentity,
+      log: (message) => console.error(message),
+      audit,
+      recovery: commLeaseSweepRecovery,
+      recoveryAllowed: () => !daemonRetiring
+    }).then(() => {
+    }),
+    startPeriodicSweep: () => startCommLeaseSweep({
+      prefetchIdentities: prefetchProcessStartIdentity,
+      runOnStart: false,
+      log: (message) => console.error(message),
+      audit,
+      recovery: commLeaseSweepRecovery
+    }),
+    bootRestore: () => runBootScopeRestore({
+      prefetchIdentities: prefetchProcessStartIdentity,
+      stateRoot: paths.root,
+      discoveryRoot: discoveryPaths.root,
+      storage,
+      ensureCommsForSession: ensureCommsForSessionFn,
+      audit
+    }).then(() => {
+    }),
+    eagerReconcile: () => reconcileEagerRegistrations({
+      storage,
+      ensure: buildEnsureRegistrationContext({ scheduleEagerRetry })
+    }).then(() => {
+    }),
+    onBootSweepFailed: async (error) => {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error(`agents-comm-bus: boot comm lease sweep failed: ${reason}`);
+      await audit.append({
+        timestamp: Date.now(),
+        kind: "comm_lease_sweep_failed",
+        detail: { phase: "boot", reason }
+      }).catch(() => {
+      });
+    }
+  }).then((handle) => {
+    const published = publishCommLeaseSweepHandle({
+      retiring: daemonRetiring,
+      current: commLeaseSweepHandle,
+      incoming: handle
+    });
+    commLeaseSweepHandle = published.current;
   });
   console.error(`agents-comm-bus ${DAEMON_VERSION} listening on ${server.url}`);
 }
@@ -7893,48 +11379,6 @@ async function bestEffortWithTimeout(action, timeoutMs, label) {
     );
   } finally {
     if (timeout) clearTimeout(timeout);
-  }
-}
-async function addAdapterForRegistration(input) {
-  const { adapter, resolution } = await createAdapterFromRegistration({
-    factory: input.factory,
-    registration: input.registration,
-    env: input.env,
-    blobs: input.blobs,
-    stateRoot: input.stateRoot,
-    storage: input.storage,
-    leaseArbiter: input.leaseArbiter
-  });
-  if (!adapter) {
-    if (resolution.status === "invalid") {
-      logInvalidCredentialResolution(input.registration, input.factory.commId, resolution);
-    }
-    return {
-      ok: false,
-      reason: resolution.status === "invalid" ? resolution.reason : unresolvedCredentialsReason(input.registration.credentials_ref),
-      resolution
-    };
-  }
-  const accountId = input.registration.bot_user_id;
-  try {
-    input.bus.registerComm(adapter);
-    for (const bridge of input.bridges) {
-      bridge.attachComm?.(adapter);
-    }
-    await adapter.start();
-    return { ok: true };
-  } catch (error) {
-    await adapter.stop().catch(() => {
-    });
-    input.bus.unregisterComm(input.registration.comm, accountId);
-    for (const bridge of input.bridges) {
-      bridge.detachComm?.(input.registration.comm, accountId);
-    }
-    return {
-      ok: false,
-      reason: `failed to start adapter: ${error instanceof Error ? error.message : String(error)}`,
-      resolution
-    };
   }
 }
 async function ensureCommsForSession(input) {
@@ -7969,110 +11413,42 @@ async function ensureCommsForSession(input) {
       storage: input.storage,
       audit: input.audit
     });
-    return;
+    return { outcomes: [] };
   }
+  const outcomes = [];
   for (const registration of registrations) {
-    let factory = input.factories.find((f) => f.commId === registration.comm);
-    const attemptedRescan = !factory && Boolean(input.rescanFactories);
-    if (!factory && input.rescanFactories) {
-      factory = await input.rescanFactories(registration.comm);
-    }
-    if (!factory) {
-      if (attemptedRescan) {
-        console.error(
-          `agents-comm-bus: no comm adapter factory for "${registration.comm}" after on-demand re-scan (project=${project}, agent=${input.agent}, bot=${registration.bot_user_id}) \u2014 skipping adapter`
-        );
-      }
-      await input.audit?.append({
-        timestamp: Date.now(),
-        kind: "comm_adapter_skip",
-        agent: input.agent,
-        detail: {
-          comm: registration.comm,
-          account_id: registration.bot_user_id,
-          account_label: registration.account_label,
-          project,
-          reason: "no_comm_factory",
-          rescanned: Boolean(input.rescanFactories)
-        }
-      }).catch(() => {
-      });
-      continue;
-    }
-    const accountId = registration.bot_user_id;
-    const key = adapterMapKey(registration.comm, accountId);
-    if (input.bus.getComm(registration.comm, accountId) || input.inFlight.has(key)) continue;
-    input.inFlight.add(key);
-    try {
-      const result = await addAdapterForRegistration({
-        factory,
-        registration,
+    outcomes.push(
+      await ensureRegistrationForAccount(registration, {
+        factories: input.factories,
+        rescanFactories: input.rescanFactories,
         bus: input.bus,
         bridges: input.bridges,
+        storage: input.storage,
         env: input.env,
         blobs: input.blobs,
         stateRoot: input.stateRoot,
-        storage: input.storage,
-        leaseArbiter: input.leaseArbiter
-      });
-      if (!result.ok) {
-        if (result.resolution.status === "invalid") {
-          await appendCredentialResolutionFailedAudit(
-            input.audit,
-            registration,
-            factory.commId,
-            result.resolution
-          );
-        } else {
-          console.error(
-            `agents-comm-bus: ensureCommsForSession could not start ${key}: ${result.reason}`
-          );
-          await input.audit?.append({
-            timestamp: Date.now(),
-            kind: "comm_adapter_skip",
-            agent: input.agent,
-            detail: {
-              comm: registration.comm,
-              account_id: registration.bot_user_id,
-              account_label: registration.account_label,
-              project,
-              reason: result.reason
-            }
-          }).catch(() => {
-          });
-        }
-      }
-    } finally {
-      input.inFlight.delete(key);
-    }
+        leaseArbiter: input.leaseArbiter,
+        inFlight: input.inFlight,
+        audit: input.audit,
+        agent: input.agent,
+        agentLeaseProperties: input.agentLeaseProperties,
+        discoveryRoot: input.discoveryRoot,
+        sessionOwnerIsLive: input.sessionOwnerIsLive
+      })
+    );
   }
-}
-async function createAdapterFromRegistration(input) {
-  const resolved = await input.factory.resolveCredentials(input.registration, input.env, {
-    storage: input.storage,
-    stateRoot: input.stateRoot
-  });
-  if (resolved.status !== "ok") {
-    return { adapter: null, resolution: resolved };
-  }
-  const adapter = input.factory.create(
-    resolved.credentials,
-    input.registration.bot_user_id,
-    {
-      blobs: input.blobs,
-      stateRoot: input.stateRoot
-    }
-  );
-  if (adapter.exclusiveResource?.() != null) {
-    return { adapter: wrapWithLease(adapter, input.leaseArbiter), resolution: resolved };
-  }
-  return { adapter, resolution: resolved };
+  return { outcomes };
 }
 async function reloadAdapters(input) {
   const added = [];
   const removed = [];
   const updated = [];
   const skipped = [];
+  if (input.options?.ensureRegistrationIds && input.ensureRegistrationContext) {
+    for (const registration_id of input.options.ensureRegistrationIds) {
+      await ensureRegistrationById(registration_id, input.ensureRegistrationContext);
+    }
+  }
   const current = /* @__PURE__ */ new Map();
   for (const entry of input.bus.listComms()) {
     current.set(adapterMapKey(entry.commId, entry.accountId), entry);
@@ -8082,8 +11458,9 @@ async function reloadAdapters(input) {
     const regs = await input.storage.listAccountRegistrations({ comm: factory.commId });
     for (const reg of regs) {
       const key = adapterMapKey(factory.commId, reg.bot_user_id);
-      const scopeActive = input.activeScopes != null && isRegistrationScopeActive(reg, input.activeScopes);
-      if (!current.has(key) && !scopeActive) continue;
+      const scopeActive = input.activeScopes != null && isRegistrationScopeActive2(reg, input.activeScopes);
+      const eagerStanding = reg.activation === "eager";
+      if (!current.has(key) && !scopeActive && !eagerStanding) continue;
       if (!desired.has(key)) desired.set(key, { factory, registration: reg });
     }
   }
@@ -8098,7 +11475,9 @@ async function reloadAdapters(input) {
       blobs: input.blobs,
       stateRoot: input.stateRoot,
       storage: input.storage,
-      leaseArbiter: input.leaseArbiter
+      leaseArbiter: input.leaseArbiter,
+      discoveryRoot: input.discoveryRoot,
+      sessionOwnerIsLive: input.sessionOwnerIsLive
     });
     if (result.ok) {
       added.push({
@@ -8111,7 +11490,7 @@ async function reloadAdapters(input) {
         account_id: entry.registration.bot_user_id,
         reason: result.reason
       });
-      if (result.resolution.status === "invalid") {
+      if (result.resolution?.status === "invalid") {
         await appendCredentialResolutionFailedAudit(
           input.audit,
           entry.registration,
@@ -8138,19 +11517,13 @@ async function reloadAdapters(input) {
   }
   for (const [key, entry] of current) {
     if (desired.has(key)) continue;
-    const adapter = input.bus.unregisterComm(entry.commId, entry.accountId);
-    for (const bridge of input.bridges) {
-      bridge.detachComm?.(entry.commId, entry.accountId);
-    }
-    if (adapter) {
-      try {
-        await adapter.stop();
-      } catch (error) {
-        console.error(
-          `agents-comm-bus: failed to stop ${entry.commId}/${entry.accountId} on reload: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-    }
+    await removeLiveAdapter({
+      bus: input.bus,
+      bridges: input.bridges,
+      leaseArbiter: input.leaseArbiter,
+      commId: entry.commId,
+      accountId: entry.accountId
+    });
     removed.push({ comm: entry.commId, account_id: entry.accountId });
   }
   const forceCredentialRefresh = new Set(
@@ -8168,7 +11541,9 @@ async function reloadAdapters(input) {
         blobs: input.blobs,
         stateRoot: input.stateRoot,
         storage: input.storage,
-        leaseArbiter: input.leaseArbiter
+        leaseArbiter: input.leaseArbiter,
+        discoveryRoot: input.discoveryRoot,
+        sessionOwnerIsLive: input.sessionOwnerIsLive
       });
       if (!adapter) {
         if (resolution.status === "invalid") {
@@ -8317,42 +11692,7 @@ function sameStringSet(a, b) {
   }
   return true;
 }
-function unresolvedCredentialsReason(ref, action = "resolve") {
-  if (ref.startsWith("env:")) {
-    return `could not ${action} credentials_ref=${ref}: env: credential refs are retired; rerun account-update-token with --bot-token to create a daemon-owned file: ref`;
-  }
-  return `could not ${action} credentials_ref=${ref}`;
-}
-function logInvalidCredentialResolution(registration, commId, resolution) {
-  const pathSuffix = resolution.path ? ` [${resolution.path}]` : "";
-  console.error(
-    `agents-comm-bus: credential file for ${commId} account ${registration.account_label} (project ${registration.project}) exists but failed to resolve: ${resolution.reason}${pathSuffix}`
-  );
-}
-async function appendCredentialResolutionFailedAudit(audit, registration, commId, resolution) {
-  await audit?.append({
-    timestamp: Date.now(),
-    kind: "credential_resolution_failed",
-    agent: registration.agent,
-    detail: {
-      comm: commId,
-      account_label: registration.account_label,
-      project: registration.project,
-      bot_user_id: registration.bot_user_id,
-      credential_path: resolution.path ?? null,
-      failure_kind: resolution.failureKind,
-      reason: resolution.reason
-    }
-  }).catch(() => {
-  });
-}
-function adapterMapKey(commId, accountId) {
-  return `${commId}:${accountId}`;
-}
-function scopeKey(agent, project, accountLabelScope) {
-  return `${agent}:${normalizeProjectPath(project)}:${accountLabelScope ?? ""}`;
-}
-function isRegistrationScopeActive(registration, activeScopes) {
+function isRegistrationScopeActive2(registration, activeScopes) {
   const prefix = `${registration.agent}:${normalizeProjectPath(registration.project)}:`;
   const legacyKey = `${registration.agent}:${normalizeProjectPath(registration.project)}`;
   for (const key of activeScopes) {
@@ -8421,6 +11761,14 @@ async function dispatchIpc(request, context) {
   if (request.method === "ensure_comms_for_scope") {
     return handleEnsureCommsForScope(params, context.ensureCommsForSession);
   }
+  if (request.method === "inspect_inbound_target") {
+    return handleInspectInboundTarget(params, {
+      storage: context.storage,
+      bridges: context.bridges,
+      daemonOwner: context.daemonOwner,
+      sessionOwnerIsLive: context.sessionOwnerIsLive
+    });
+  }
   if (request.method === "list_conversations") {
     return context.bus.listConversations({
       comm: params.comm,
@@ -8437,6 +11785,24 @@ async function dispatchIpc(request, context) {
       context.env,
       context.rescanFactories
     );
+  }
+  if (request.method === "herdr_register_pane") {
+    return handleHerdrRegisterPane(params, context);
+  }
+  if (request.method === "herdr_release_pane") {
+    return handleHerdrReleasePane(params, context);
+  }
+  if (request.method === "wake_mode_get") {
+    return handleWakeModeGet(params, context.storage);
+  }
+  if (request.method === "wake_mode_set") {
+    return handleWakeModeSet(params, context.storage);
+  }
+  if (request.method === "wake_mode_clear") {
+    return handleWakeModeClear(params, context.storage);
+  }
+  if (request.method === "wake_mode_list") {
+    return handleWakeModeList(context.storage);
   }
   const bridge = context.bridgesByMethod.get(request.method);
   if (bridge) {
@@ -8474,29 +11840,170 @@ async function probeCommIdentity(params, factories, env, rescanFactories) {
     account_username: identity.accountUsername ?? null
   };
 }
+async function handleHerdrRegisterPane(params, context) {
+  const project = normalizeProjectPath(requiredDaemonString(params.project, "project"));
+  const agent = requiredDaemonString(params.agent, "agent");
+  if (!context.bridges.some((bridge) => bridge.agentId === agent)) {
+    throw new Error(`unknown agent for herdr_register_pane: ${agent}`);
+  }
+  const identity = parseHerdrIdentity(params.identity);
+  if (!identity || identity.agent !== agent) {
+    throw new Error("herdr_register_pane requires valid params.identity");
+  }
+  const session_id = herdrSessionId(identity);
+  const now = Date.now();
+  const existing = await context.storage.getSession(session_id);
+  if (!existing) {
+    await context.storage.insertSession({
+      schema_version: SCHEMA_VERSION_SESSION,
+      session_id,
+      agent,
+      project,
+      created_at: now,
+      lease_holder_connection_id: null,
+      lease_acquired_at: null,
+      lease_released_at: null,
+      lease_owner_process_pid: null,
+      lease_owner_process_label: null,
+      lease_owner_process_registered_at: null,
+      lease_owner_process_start_time: null,
+      lease_owner_daemon_discovery_root: null,
+      lease_owner_daemon_checkout_root: null,
+      lease_owner_daemon_state_root: null,
+      lease_owner_daemon_bin: null,
+      lease_owner_daemon_authority_rank: null,
+      most_recent_inbound_conversation_id: null,
+      account_label_scope: null,
+      status: "active",
+      wake_identity: null,
+      wake_strict: null
+    });
+  } else if (existing.status === "ended") {
+    await context.storage.reactivateSessionIfEnded(session_id);
+  }
+  await context.storage.setSessionWakeTarget(
+    session_id,
+    identity,
+    params.wake_strict !== void 0 ? parseWakeStrict(params.wake_strict) : void 0
+  );
+  const session = await context.storage.getSession(session_id);
+  if (!session) {
+    throw new Error("herdr_register_pane failed to load session row");
+  }
+  await supersedeStaleSessionsOnHerdrRegister(
+    context.storage,
+    session,
+    createSessionOwnerLiveness()
+  );
+  for (const bridge of context.bridges) {
+    if (bridge.agentId === agent) {
+      bridge.onHerdrPaneRegistered?.(session);
+    }
+  }
+  await context.ensureCommsForSession(project, agent, { accountLabelScope: null });
+  const wake_strategy = await wakeStrategyForSession(context.storage, session);
+  return { ok: true, session, wake_strategy };
+}
+async function handleHerdrReleasePane(params, context) {
+  const identity = parseHerdrIdentity(params.identity);
+  if (!identity) {
+    throw new Error("herdr_release_pane requires valid params.identity");
+  }
+  const session_id = herdrSessionId(identity);
+  const session = await context.storage.getSession(session_id);
+  if (!session) {
+    return { ok: true };
+  }
+  if (session.lease_holder_connection_id) {
+    await context.storage.setSessionWakeTarget(session_id, null, null);
+  } else {
+    await context.storage.endSessionIfUnchanged(
+      session_id,
+      sessionEndObservation(session),
+      Date.now()
+    );
+  }
+  return { ok: true };
+}
+async function handleWakeModeGet(params, storage) {
+  const agent = requiredDaemonString(params.agent, "agent");
+  const projectRaw = typeof params.project === "string" ? params.project : "";
+  const canonical = projectRaw === "" ? "" : normalizeProjectPath(projectRaw);
+  const effective = await storage.getWakeMode(canonical, agent);
+  const scoped = await storageWakeModeRow(storage, canonical, agent);
+  const global = await storageWakeModeRow(storage, "", agent);
+  const source = scoped != null ? { scope: "project", project: canonical } : global != null ? { scope: "global", project: "" } : { scope: "default", project: "" };
+  return { ok: true, mode: effective, source };
+}
+async function storageWakeModeRow(storage, project, agent) {
+  const rows = await storage.listWakeModes();
+  const row = rows.find((entry) => entry.project === project && entry.agent === agent);
+  return row?.mode ?? null;
+}
+async function handleWakeModeSet(params, storage) {
+  const agent = requiredDaemonString(params.agent, "agent");
+  const mode = requiredDaemonString(params.mode, "mode");
+  if (mode !== "auto" && mode !== "native") {
+    throw new Error("wake_mode_set mode must be auto or native");
+  }
+  const projectRaw = typeof params.project === "string" ? params.project : "";
+  const project = projectRaw === "" ? "" : normalizeProjectPath(projectRaw);
+  await storage.setWakeMode(project, agent, mode, Date.now());
+  return { ok: true };
+}
+async function handleWakeModeClear(params, storage) {
+  const agent = requiredDaemonString(params.agent, "agent");
+  const projectRaw = typeof params.project === "string" ? params.project : "";
+  const project = projectRaw === "" ? "" : normalizeProjectPath(projectRaw);
+  await storage.clearWakeMode(project, agent);
+  return { ok: true };
+}
+async function handleWakeModeList(storage) {
+  const rows = await storage.listWakeModes();
+  return { ok: true, rows };
+}
+function requiredDaemonString(value, name) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${name} is required`);
+  }
+  return value.trim();
+}
 function parseReloadOptions(params) {
-  const raw = params.forceCredentialRefresh;
-  if (!Array.isArray(raw)) return {};
-  const forceCredentialRefresh = raw.flatMap((item) => {
-    if (!item || typeof item !== "object") return [];
-    const record = item;
-    if (record.comm == null || record.accountId == null) return [];
-    return [{
-      comm: String(record.comm),
-      accountId: String(record.accountId)
-    }];
-  });
-  return { forceCredentialRefresh };
+  const forceRaw = params.forceCredentialRefresh;
+  const ensureRaw = params.ensureRegistrationIds;
+  const options = {};
+  if (Array.isArray(forceRaw)) {
+    options.forceCredentialRefresh = forceRaw.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const record = item;
+      if (record.comm == null || record.accountId == null) return [];
+      return [{
+        comm: String(record.comm),
+        accountId: String(record.accountId)
+      }];
+    });
+  }
+  if (Array.isArray(ensureRaw)) {
+    options.ensureRegistrationIds = ensureRaw.filter((id) => typeof id === "string" && id.length > 0);
+  }
+  return options;
 }
 
 // ../core-daemon/bridges/claude/bridge.ts
-import crypto3 from "node:crypto";
+import crypto4 from "node:crypto";
 
 // ../core-daemon/runtime/agent-bridge.ts
-function sessionLeaseOwnerWithDaemon(ownerFromParams, daemonOwner) {
+async function sessionLeaseOwnerWithDaemon(ownerFromParams, daemonOwner, identity = { prefetch: prefetchProcessStartIdentity, read: readProcessStartEpochMs }) {
+  const pid = ownerFromParams?.process_pid ?? null;
+  let startTime = ownerFromParams?.process_start_time ?? null;
+  if (pid != null && startTime == null) {
+    await identity.prefetch([pid]);
+    startTime = identity.read(pid);
+  }
   return {
-    process_pid: ownerFromParams?.process_pid ?? null,
+    process_pid: pid,
     process_label: ownerFromParams?.process_label,
+    process_start_time: pid != null ? startTime : null,
     daemon: {
       discovery_root: daemonOwner.discoveryRoot,
       checkout_root: daemonOwner.checkoutRoot,
@@ -8508,10 +12015,10 @@ function sessionLeaseOwnerWithDaemon(ownerFromParams, daemonOwner) {
 }
 
 // ../core-daemon/bridges/claude/wake.ts
-import crypto2 from "node:crypto";
-import { mkdir as mkdir7, writeFile as writeFile2 } from "node:fs/promises";
-import os4 from "node:os";
-import path4 from "node:path";
+import crypto3 from "node:crypto";
+import { mkdir as mkdir9, writeFile as writeFile3 } from "node:fs/promises";
+import os5 from "node:os";
+import path8 from "node:path";
 function hashProjectKey(projectPath) {
   let hash = 2166136261;
   for (let i = 0; i < projectPath.length; i += 1) {
@@ -8520,9 +12027,9 @@ function hashProjectKey(projectPath) {
   }
   return hash.toString(16).padStart(8, "0");
 }
-function claudeWakeDirForProject(projectPath, homeDir = os4.homedir(), accountLabelScope = null) {
+function claudeWakeDirForProject(projectPath, homeDir = os5.homedir(), accountLabelScope = null) {
   const canonical = normalizeProjectPath(projectPath);
-  const basename = path4.basename(canonical) || "project";
+  const basename = path8.basename(canonical) || "project";
   const legacyDir = `${basename}-${hashProjectKey(canonical)}`;
   let canonicalScope;
   try {
@@ -8535,40 +12042,27 @@ function claudeWakeDirForProject(projectPath, homeDir = os4.homedir(), accountLa
     );
     canonicalScope = `__invalid__:${accountLabelScope}`;
   }
-  return path4.join(
+  return path8.join(
     homeDir,
     ".agents-comm-bus",
     "claude-wake",
     "sessions",
-    canonicalScope ? `${legacyDir}-${crypto2.createHash("sha256").update(canonicalScope).digest("hex").slice(0, 12)}` : legacyDir
+    canonicalScope ? `${legacyDir}-${crypto3.createHash("sha256").update(canonicalScope).digest("hex").slice(0, 12)}` : legacyDir
   );
 }
 async function writeClaudeWakeTrigger(wakeDir, now = Date.now) {
-  await mkdir7(wakeDir, { recursive: true });
-  await writeFile2(path4.join(wakeDir, "trigger-enter"), `${now()}
+  await mkdir9(wakeDir, { recursive: true });
+  await writeFile3(path8.join(wakeDir, "trigger-enter"), `${now()}
 `, "utf8");
 }
-var WAKE_SEED_MAX_CHARS = 2e3;
-function sanitizeWakeSeed(text) {
-  if (!text) return "";
-  const normalized = text.replace(/\r\n?/g, "\n").replace(/[\x00-\x09\x0B-\x1F\x7F]/g, "").trim();
-  return normalized.length > WAKE_SEED_MAX_CHARS ? normalized.slice(0, WAKE_SEED_MAX_CHARS) : normalized;
-}
-function buildWakeSeed(input) {
-  const body = (input.body ?? "").trim();
-  if (!body) return "";
-  const comm = input.comm && input.comm.length > 0 ? input.comm : "message";
-  const sender = input.sender && input.sender.length > 0 ? input.sender : "unknown sender";
-  return sanitizeWakeSeed(`${comm} message from ${sender}: ${body}`);
-}
 async function writeClaudeWakeSeed(wakeDir, text) {
-  await mkdir7(wakeDir, { recursive: true });
-  await writeFile2(path4.join(wakeDir, "wake-seed.txt"), text, "utf8");
+  await mkdir9(wakeDir, { recursive: true });
+  await writeFile3(path8.join(wakeDir, "wake-seed.txt"), text, "utf8");
 }
 async function writeClaudeWakeResponse(wakeDir, payload) {
-  await mkdir7(wakeDir, { recursive: true });
-  await writeFile2(
-    path4.join(wakeDir, "permission-response.json"),
+  await mkdir9(wakeDir, { recursive: true });
+  await writeFile3(
+    path8.join(wakeDir, "permission-response.json"),
     JSON.stringify(payload),
     "utf8"
   );
@@ -8601,7 +12095,7 @@ var ClaudeWakeRegistry = class {
       project,
       wakeDir: input.wakeDir ?? claudeWakeDirForProject(
         project,
-        os4.homedir(),
+        os5.homedir(),
         input.account_label_scope ?? null
       ),
       registeredAt: this.now(),
@@ -8652,10 +12146,55 @@ var ClaudeWakeRegistry = class {
     await writeClaudeWakeTrigger(registration.wakeDir, this.now);
     return true;
   }
+  registerFromSession(session) {
+    return this.register({
+      session: session.session_id,
+      project: session.project,
+      account_label_scope: session.account_label_scope
+    });
+  }
+  async resolveRegistrationForInbound(conversation, _message) {
+    if (conversation.agent !== "claude") return null;
+    if (!this.storage) return null;
+    const session = await selectActiveSessionForInboundWake(
+      this.storage,
+      conversation.project,
+      "claude",
+      conversation,
+      this.sessionOwnerIsLive
+    );
+    if (!session) return null;
+    const registration = this.getForSession(session.session_id) ?? this.registerFromSession(session);
+    return { registration, session };
+  }
   async wakeConversation(conversation, message) {
     if (conversation.agent !== "claude") return false;
-    const registration = this.latestForProject(conversation.project, conversation) ?? await this.hydrateLatestForProject(conversation.project, conversation);
-    if (!registration) return false;
+    if (!this.storage) {
+      const registration2 = this.latestForProject(conversation.project, conversation);
+      if (!registration2) return false;
+      const seed2 = buildWakeSeed({
+        comm: message?.chat.comm,
+        sender: message?.sender?.display_name ?? message?.sender?.id,
+        body: message?.text
+      });
+      if (seed2) {
+        try {
+          await writeClaudeWakeSeed(registration2.wakeDir, seed2);
+        } catch {
+        }
+      }
+      await writeClaudeWakeTrigger(registration2.wakeDir, this.now);
+      return true;
+    }
+    const session = await selectActiveSessionForInboundWake(
+      this.storage,
+      conversation.project,
+      "claude",
+      conversation,
+      this.sessionOwnerIsLive
+    );
+    if (!session) return false;
+    const registration = this.getForSession(session.session_id) ?? this.registerFromSession(session);
     const seed = buildWakeSeed({
       comm: message?.chat.comm,
       sender: message?.sender?.display_name ?? message?.sender?.id,
@@ -8678,29 +12217,15 @@ var ClaudeWakeRegistry = class {
    */
   async hydrateLatestForProject(project, conversation) {
     if (!this.storage) return void 0;
-    const resolved = normalizeProjectPath(project);
-    const sessions = await this.storage.listSessions({
-      project: resolved,
-      agent: "claude",
-      status: "active"
-    });
-    if (sessions.length === 0) return void 0;
-    const live = sessions.filter(this.sessionOwnerIsLive);
-    const pool = live.length > 0 ? live : sessions;
-    let match = conversation ? resolveSessionForConversation(pool, conversation, (sess) => sess.session_id) : pool[0];
-    if (conversation && !match) {
-      match = pool.find(
-        (session) => session.account_label_scope == null
-      );
-      if (!match) return void 0;
-    }
-    const latest = match;
-    if (!latest) return void 0;
-    return this.register({
-      session: latest.session_id,
-      project: resolved,
-      account_label_scope: latest.account_label_scope
-    });
+    const session = await selectActiveSessionForInboundWake(
+      this.storage,
+      project,
+      "claude",
+      conversation,
+      this.sessionOwnerIsLive
+    );
+    if (!session) return void 0;
+    return this.registerFromSession(session);
   }
   /**
    * On a miss in `writeResponseForSession`, look up the specific session
@@ -8826,6 +12351,16 @@ var ClaudeBridge = class {
         const payload = wakePayloadFromDecision(decision);
         if (!payload) return;
         try {
+          const sessionRecord = await this.options.storage.getSession(query.session);
+          if (sessionRecord) {
+            const herdr = await herdrRespond(sessionRecord, payload, {
+              storage: this.options.storage,
+              audit: this.options.audit,
+              clientFactory: this.options.herdrClientFactory
+            });
+            if (herdr.ok) return;
+            if (herdr.strict) return;
+          }
           const delivered = await this.wake.writeResponseForSession(query.session, payload);
           if (!delivered) {
             await this.auditWakeFailure({
@@ -8871,9 +12406,34 @@ var ClaudeBridge = class {
   invalidateRegistrationCaches() {
     this.ownedAccountsCache = null;
   }
+  onHerdrPaneRegistered(session) {
+    this.wake.registerFromSession(session);
+  }
   async onInboundConversation(conversation, message) {
     if (conversation.agent !== this.agentId) return;
     try {
+      const target = await this.wake.resolveRegistrationForInbound(conversation, message);
+      if (target) {
+        const strategy = await wakeStrategyForSession(
+          this.options.storage,
+          target.session
+        );
+        if (strategy === "herdr") {
+          const seed = wakeSeedFromMessage({
+            comm: message?.chat.comm,
+            sender: message?.sender?.display_name ?? message?.sender?.id,
+            body: message?.text
+          });
+          const herdr = await herdrWake(target.session, seed, {
+            storage: this.options.storage,
+            audit: this.options.audit,
+            clientFactory: this.options.herdrClientFactory,
+            conversationId: conversation.conversation_id
+          });
+          if (herdr.ok) return;
+          if (herdr.strict) return;
+        }
+      }
       const delivered = await this.wake.wakeConversation(conversation, message);
       if (!delivered) {
         await this.auditWakeFailure({
@@ -8954,15 +12514,75 @@ var ClaudeBridge = class {
    * as a follow-up.
    */
   async ensureCommsBestEffort(project, accountLabelScope) {
+    const hook = this.options.ensureCommsForSession;
+    if (!hook) return false;
     try {
-      await this.options.ensureCommsForSession?.(project, this.agentId, {
+      const result = await hook(project, this.agentId, {
         accountLabelScope: accountLabelScope ?? null
       });
+      return result.rehydrated;
     } catch (error) {
       console.error(
         `agents-comm-bus: ensureCommsForSession failed for ${project}/${this.agentId}: ${error instanceof Error ? error.message : String(error)}`
       );
+      return false;
     }
+  }
+  /** AGE-91: daemon-local route = a registered wake dir for this session. */
+  routeReady(session) {
+    return this.wake.getForSession(session) !== void 0;
+  }
+  isLocallyDeliverable(session) {
+    return isSessionLocallyDeliverable(
+      session,
+      this.routeReady(session.session_id),
+      this.sessionOwnerIsLive
+    );
+  }
+  /**
+   * AGE-89: after a deliverability edge with confirmed rehydration, wake once
+   * for the newest in-scope pending row. The agent drain consumes the queue;
+   * the daemon must never remove pendingInbound here (AGE-64).
+   */
+  async redrivePendingInboundCoalesced(sessionId) {
+    const sess = await this.options.storage.getSession(sessionId);
+    if (!sess) return;
+    const [registrations, sessions] = await Promise.all([
+      this.options.storage.listAccountRegistrations({
+        project: sess.project,
+        agent: this.agentId
+      }),
+      this.options.storage.listSessions({
+        project: sess.project,
+        agent: this.agentId,
+        status: "active"
+      })
+    ]);
+    const scopedRegs = filterRegistrationsForSession(
+      registrations,
+      sess,
+      sessions,
+      this.sessionOwnerIsLive
+    );
+    const ownedKeys = new Set(
+      scopedRegs.map((reg) => `${reg.comm}:${reg.bot_user_id}`)
+    );
+    const inScope = this.options.pendingInbound.filter((entry) => {
+      if (entry.conversation.project !== sess.project) return false;
+      if (entry.conversation.agent !== this.agentId) return false;
+      if (!ownedKeys.has(accountKey(entry))) return false;
+      return sessionOwnsConversation(
+        sess,
+        sessions,
+        entry.conversation,
+        this.sessionOwnerIsLive
+      );
+    });
+    if (inScope.length === 0) return;
+    const seed = inScope.reduce(
+      (latest, entry) => entry.message.received_at > latest.message.received_at ? entry : latest
+    );
+    await this.onInboundConversation(seed.conversation, seed.message);
   }
   async ownedAccountKeys(session) {
     if (session) {
@@ -8997,9 +12617,13 @@ var ClaudeBridge = class {
     return this.ownedAccountsCache;
   }
   async registerSession(params, socket) {
+    const herdrParams = validateHerdrRegisterParams(params, this.agentId);
+    if (!herdrParams.ok) {
+      return { ok: false, reason: herdrParams.reason };
+    }
     const session = requiredString(params.session, "session");
     const project = normalizeProjectPath(requiredString(params.project, "project"));
-    const connectionId = typeof params.connection_id === "string" ? params.connection_id : `claude:${session}:${crypto3.randomUUID()}`;
+    const connectionId = typeof params.connection_id === "string" ? params.connection_id : `claude:${session}:${crypto4.randomUUID()}`;
     const now = Date.now();
     const wakeDir = typeof params.wake_dir === "string" ? params.wake_dir : typeof params.wakeDir === "string" ? params.wakeDir : void 0;
     const accountLabelScope = accountLabelScopeFromParams(params);
@@ -9015,6 +12639,7 @@ var ClaudeBridge = class {
       lease_owner_process_pid: null,
       lease_owner_process_label: null,
       lease_owner_process_registered_at: null,
+      lease_owner_process_start_time: null,
       lease_owner_daemon_discovery_root: null,
       lease_owner_daemon_checkout_root: null,
       lease_owner_daemon_state_root: null,
@@ -9022,13 +12647,24 @@ var ClaudeBridge = class {
       lease_owner_daemon_authority_rank: null,
       most_recent_inbound_conversation_id: null,
       account_label_scope: accountLabelScope,
-      status: "active"
+      status: "active",
+      wake_identity: null,
+      wake_strict: null
     });
+    await applyHerdrWakeTargetFromRegisterParams(
+      this.options.storage,
+      session,
+      params,
+      this.agentId,
+      this.sessionOwnerIsLive
+    );
+    const baselineSession = await this.options.storage.getSession(session);
+    const deliverabilityBaseline = baselineSession ? this.isLocallyDeliverable(baselineSession) : false;
     const acquired = await this.options.storage.acquireSessionLease(
       session,
       connectionId,
       now,
-      this.options.daemonOwner ? sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams(params), this.options.daemonOwner) : sessionLeaseOwnerFromParams(params)
+      this.options.daemonOwner ? await sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams(params), this.options.daemonOwner) : sessionLeaseOwnerFromParams(params)
     );
     if (!acquired) {
       await this.ensureCommsBestEffort(project, accountLabelScope);
@@ -9047,8 +12683,15 @@ var ClaudeBridge = class {
         Date.now()
       );
     });
-    await this.ensureCommsBestEffort(project, accountLabelScope);
-    return { ok: true, wake_dir: registration.wakeDir };
+    const rehydrated = await this.ensureCommsBestEffort(project, accountLabelScope);
+    const afterSession = await this.options.storage.getSession(session);
+    const deliverabilityAfter = afterSession ? this.isLocallyDeliverable(afterSession) : false;
+    if (!deliverabilityBaseline && deliverabilityAfter && rehydrated) {
+      await this.redrivePendingInboundCoalesced(session);
+    }
+    const afterWake = await this.options.storage.getSession(session);
+    const wake_strategy = afterWake ? await wakeStrategyForSession(this.options.storage, afterWake) : "native";
+    return { ok: true, wake_dir: registration.wakeDir, wake_strategy };
   }
   async drainInbound(params) {
     const session = typeof params.session === "string" ? params.session : void 0;
@@ -9134,7 +12777,7 @@ var ClaudeBridge = class {
    * setQuerySourceMessage. Used by the IPC handler and the AGE-37 sequencer.
    */
   async openQueryCore(input) {
-    const queryId = `q_${crypto3.randomUUID()}`;
+    const queryId = `q_${crypto4.randomUUID()}`;
     const query = {
       schema_version: 1,
       query_id: queryId,
@@ -9510,9 +13153,11 @@ Reply with <b>number</b> to select`;
 function sessionLeaseOwnerFromParams(params) {
   const pid = numberParam(params.owner_process_pid);
   if (!pid) return void 0;
+  const startTime = numberParam(params.owner_process_start_time);
   return {
     process_pid: pid,
-    process_label: typeof params.owner_process_label === "string" ? params.owner_process_label : "claude"
+    process_label: typeof params.owner_process_label === "string" ? params.owner_process_label : "claude",
+    process_start_time: startTime
   };
 }
 function numberParam(value) {
@@ -9537,10 +13182,10 @@ var ClaudeBridgeFactory = class {
 };
 
 // ../core-daemon/bridges/codex/bridge.ts
-import crypto5 from "node:crypto";
+import crypto6 from "node:crypto";
 
 // ../core-daemon/bridges/codex/adapter.ts
-import crypto4 from "node:crypto";
+import crypto5 from "node:crypto";
 
 // ../core-daemon/bridges/codex/app-server.ts
 var DEFAULT_CODEX_APP_SERVER_URL = "ws://127.0.0.1:4500";
@@ -9556,8 +13201,8 @@ var WebSocketCodexAppServerClient = class {
   call(method, params, options = {}) {
     return callOnce(this.url, method, params, options);
   }
-  listLoadedThreads() {
-    return this.call("thread/loaded/list", {});
+  listThreads() {
+    return this.call("thread/list", {});
   }
   listThreadTurns(threadId) {
     return this.call("thread/turns/list", { threadId });
@@ -9575,68 +13220,91 @@ var WebSocketCodexAppServerClient = class {
       input: [{ type: "text", text }]
     });
   }
-  async wakeMostRecentThread(text = ".") {
-    const thread = await this.mostRecentThread();
-    if (!thread.ok) return thread;
+  async validateRecordedTarget(target) {
+    if (!target.threadId || !target.expectedProject) {
+      return { ok: false, reason: "missing-recorded-target", threadId: target.threadId };
+    }
+    let result;
     try {
-      await this.startTurn(thread.threadId, text);
-      return { ok: true, threadId: thread.threadId, method: "turn/start" };
+      result = await this.listThreads();
+    } catch (error) {
+      return {
+        ok: false,
+        reason: "listThreads-failed",
+        error: error instanceof Error ? error.message : String(error),
+        threadId: target.threadId,
+        url: this.url
+      };
+    }
+    const threads = listedThreads(result);
+    const match = threads.find((entry) => threadIdFrom(entry) === target.threadId);
+    if (!match) {
+      return {
+        ok: false,
+        reason: "recorded-thread-absent",
+        threadId: target.threadId,
+        raw: stringifyShort(result)
+      };
+    }
+    const statusType = threadStatusType(match);
+    if (!isLiveThreadStatus(statusType)) {
+      return {
+        ok: false,
+        reason: "recorded-thread-not-live",
+        threadId: target.threadId,
+        raw: stringifyShort(match)
+      };
+    }
+    const cwd = threadCwd(match);
+    if (!cwd) {
+      return {
+        ok: false,
+        reason: "recorded-thread-missing-cwd",
+        threadId: target.threadId,
+        raw: stringifyShort(match)
+      };
+    }
+    if (normalizeProjectPath(cwd) !== normalizeProjectPath(target.expectedProject)) {
+      return {
+        ok: false,
+        reason: "recorded-thread-wrong-project",
+        threadId: target.threadId,
+        raw: stringifyShort(match)
+      };
+    }
+    return { ok: true, threadId: target.threadId, cwd };
+  }
+  async wakeRecordedTarget(target, text = ".") {
+    const validated = await this.validateRecordedTarget(target);
+    if (!validated.ok) return validated;
+    try {
+      await this.startTurn(validated.threadId, text);
+      return { ok: true, threadId: validated.threadId, method: "turn/start" };
     } catch (error) {
       return {
         ok: false,
         reason: "startTurn-failed",
         error: error instanceof Error ? error.message : String(error),
-        threadId: thread.threadId
+        threadId: validated.threadId
       };
     }
   }
-  async steerMostRecentThread(text) {
-    const thread = await this.mostRecentThread();
-    if (!thread.ok) return thread;
-    const turn = await this.activeTurn(thread.threadId);
+  async steerRecordedTarget(target, text) {
+    const validated = await this.validateRecordedTarget(target);
+    if (!validated.ok) return validated;
+    const turn = await this.activeTurn(validated.threadId);
     if (!turn.ok) return turn;
     try {
-      await this.steerTurn(thread.threadId, text, turn.turnId);
-      return { ok: true, threadId: thread.threadId, method: "turn/steer" };
+      await this.steerTurn(validated.threadId, text, turn.turnId);
+      return { ok: true, threadId: validated.threadId, method: "turn/steer" };
     } catch (error) {
       return {
         ok: false,
         reason: "steerTurn-failed",
         error: error instanceof Error ? error.message : String(error),
-        threadId: thread.threadId
+        threadId: validated.threadId
       };
     }
-  }
-  async mostRecentThread() {
-    let result;
-    try {
-      result = await this.listLoadedThreads();
-    } catch (error) {
-      return {
-        ok: false,
-        reason: "listLoadedThreads-failed",
-        error: error instanceof Error ? error.message : String(error),
-        url: this.url
-      };
-    }
-    const threads = loadedThreads(result);
-    if (threads.length === 0) {
-      return {
-        ok: false,
-        reason: "no-threads-loaded",
-        raw: stringifyShort(result)
-      };
-    }
-    const target = [...threads].sort(compareThreadRecency)[0];
-    const threadId = threadIdFrom(target);
-    if (!threadId) {
-      return {
-        ok: false,
-        reason: "no-thread-id-in-response",
-        raw: stringifyShort(target)
-      };
-    }
-    return { ok: true, threadId };
   }
   async activeTurn(threadId) {
     let result;
@@ -9736,7 +13404,7 @@ function callOnce(url, method, params, { timeoutMs = 5e3 } = {}) {
     });
   });
 }
-function loadedThreads(result) {
+function listedThreads(result) {
   if (Array.isArray(result)) return result;
   if (!result || typeof result !== "object") return [];
   const record = result;
@@ -9750,18 +13418,41 @@ function listedTurns(result) {
   const candidate = record.data ?? record.turns ?? record.items;
   return Array.isArray(candidate) ? candidate : [];
 }
-function compareThreadRecency(a, b) {
-  if (typeof a === "string" || typeof b === "string") return 0;
-  const left = Date.parse(String(a?.lastActiveAt ?? a?.updatedAt ?? a?.startedAt ?? 0)) || 0;
-  const right = Date.parse(String(b?.lastActiveAt ?? b?.updatedAt ?? b?.startedAt ?? 0)) || 0;
-  return right - left;
-}
 function threadIdFrom(value) {
   if (typeof value === "string" && value.length > 0) return value;
   if (!value || typeof value !== "object") return null;
   const record = value;
   const id = record.threadId ?? record.id;
   return typeof id === "string" && id.length > 0 ? id : null;
+}
+function threadCwd(value) {
+  if (!value || typeof value !== "object") return null;
+  const cwd = value.cwd;
+  return typeof cwd === "string" && cwd.length > 0 ? cwd : null;
+}
+function threadStatusType(value) {
+  if (!value || typeof value !== "object") return null;
+  const status = value.status;
+  if (!status || typeof status !== "object") return null;
+  const type = status.type;
+  return typeof type === "string" ? type : null;
+}
+function isLiveThreadStatus(statusType) {
+  return statusType === "active" || statusType === "idle";
+}
+function liveThreadsMatchingProject(listResult, expectedProject) {
+  const normalizedExpected = normalizeProjectPath(expectedProject);
+  const matches = [];
+  for (const entry of listedThreads(listResult)) {
+    const threadId = threadIdFrom(entry);
+    if (!threadId) continue;
+    if (!isLiveThreadStatus(threadStatusType(entry))) continue;
+    const cwd = threadCwd(entry);
+    if (!cwd) continue;
+    if (normalizeProjectPath(cwd) !== normalizedExpected) continue;
+    matches.push({ threadId, cwd });
+  }
+  return matches;
 }
 function turnIdFrom(value) {
   if (typeof value === "string" && value.length > 0) return value;
@@ -9799,7 +13490,7 @@ var CodexAgentAdapter = class {
     this.defaultTtlSeconds = options.defaultTtlSeconds ?? 300;
     this.defaultAppServerUrl = options.defaultAppServerUrl ?? DEFAULT_CODEX_APP_SERVER_URL;
     this.wakePlaceholder = options.wakePlaceholder ?? ".";
-    this.queryIdFactory = options.queryIdFactory ?? (() => `codex:${crypto4.randomUUID()}`);
+    this.queryIdFactory = options.queryIdFactory ?? (() => `codex:${crypto5.randomUUID()}`);
     this.appServerClientFactory = options.appServerClientFactory ?? ((url) => new WebSocketCodexAppServerClient(url));
   }
   options;
@@ -9842,6 +13533,21 @@ var CodexAgentAdapter = class {
     const state = this.sessions.get(session);
     if (state && url) state.appServerUrl = url;
   }
+  setWakeTarget(session, target) {
+    const state = this.sessions.get(session);
+    if (!state) return;
+    state.project = target.project;
+    if (target.appServerUrl) state.appServerUrl = target.appServerUrl;
+    if (target.threadId) state.threadId = target.threadId;
+  }
+  recordedTargetFor(session) {
+    const state = this.sessions.get(session);
+    if (!state?.threadId || !state.project) return null;
+    return {
+      threadId: state.threadId,
+      expectedProject: state.project
+    };
+  }
   appServerUrlFor(session) {
     return this.sessions.get(session)?.appServerUrl ?? this.defaultAppServerUrl;
   }
@@ -9881,7 +13587,8 @@ var CodexAgentAdapter = class {
     });
   }
   async wake(session) {
-    const result = await this.clientFor(session).wakeMostRecentThread(this.wakePlaceholder);
+    const target = this.requireRecordedTarget(session);
+    const result = await this.clientFor(session).wakeRecordedTarget(target, this.wakePlaceholder);
     await this.sessions.get(session)?.controlChannel.send({
       type: "turn.wake",
       agent: this.id,
@@ -9891,9 +13598,10 @@ var CodexAgentAdapter = class {
     throwIfTurnFailed(result);
   }
   async wakeOrSteer(session, payload) {
+    const target = this.requireRecordedTarget(session);
     const client = this.clientFor(session);
     const text = steerText(payload);
-    const steerResult = await client.steerMostRecentThread(text);
+    const steerResult = await client.steerRecordedTarget(target, text);
     await this.sessions.get(session)?.controlChannel.send({
       type: "turn.steer",
       agent: this.id,
@@ -9901,7 +13609,10 @@ var CodexAgentAdapter = class {
       result: steerResult
     });
     if (steerResult.ok) return steerResult;
-    const wakeResult = await client.wakeMostRecentThread(text);
+    if (isCodexWakeTargetValidationFailure(steerResult.reason)) {
+      return steerResult;
+    }
+    const wakeResult = await client.wakeRecordedTarget(target, text);
     await this.sessions.get(session)?.controlChannel.send({
       type: "turn.wake",
       agent: this.id,
@@ -9909,12 +13620,13 @@ var CodexAgentAdapter = class {
       result: wakeResult,
       fallback_from: steerResult
     });
-    throwIfTurnFailed(wakeResult);
-    return wakeResult.ok ? { ...wakeResult, fallbackFrom: steerResult } : wakeResult;
+    if (!wakeResult.ok) return wakeResult;
+    return { ...wakeResult, fallbackFrom: steerResult };
   }
   async steer(session, payload) {
+    const target = this.requireRecordedTarget(session);
     const text = steerText(payload);
-    const result = await this.clientFor(session).steerMostRecentThread(text);
+    const result = await this.clientFor(session).steerRecordedTarget(target, text);
     await this.sessions.get(session)?.controlChannel.send({
       type: "turn.steer",
       agent: this.id,
@@ -9952,6 +13664,15 @@ var CodexAgentAdapter = class {
     if (!state) throw new Error(`Codex session is not connected: ${session}`);
     return state;
   }
+  requireRecordedTarget(session) {
+    const target = this.recordedTargetFor(session);
+    if (!target) {
+      throw new Error(
+        `Codex wake target is not configured for session ${session} (missing threadId or project)`
+      );
+    }
+    return target;
+  }
 };
 function mapCodexHookPayloadToQuery(session, payload, options = {}) {
   const agent = options.agent ?? "codex";
@@ -9959,7 +13680,7 @@ function mapCodexHookPayloadToQuery(session, payload, options = {}) {
   const toolName = payload.tool_name ?? "PermissionRequest";
   const query = {
     schema_version: SCHEMA_VERSION_QUERY,
-    query_id: options.queryId ?? `codex:${crypto4.randomUUID()}`,
+    query_id: options.queryId ?? `codex:${crypto5.randomUUID()}`,
     agent,
     session,
     kind: "approval",
@@ -10013,6 +13734,9 @@ function steerText(payload) {
   }
   return JSON.stringify(payload);
 }
+function isCodexWakeTargetValidationFailure(reason) {
+  return reason === "missing-recorded-target" || reason === "recorded-thread-absent" || reason === "recorded-thread-not-live" || reason === "recorded-thread-wrong-project" || reason === "recorded-thread-missing-cwd" || reason === "listThreads-failed";
+}
 function throwIfTurnFailed(result) {
   if (!result.ok) {
     throw new Error(`Codex app-server turn control failed: ${result.reason}${result.error ? `: ${result.error}` : ""}`);
@@ -10024,9 +13748,9 @@ function recordOrEmpty2(value) {
 
 // ../core-daemon/bridges/codex/app-server-lifecycle.ts
 import { execFileSync } from "node:child_process";
-import { readFile as readFile6, writeFile as writeFile3 } from "node:fs/promises";
-import os5 from "node:os";
-import path5 from "node:path";
+import { readFile as readFile8, writeFile as writeFile4 } from "node:fs/promises";
+import os6 from "node:os";
+import path9 from "node:path";
 var DEFAULT_STOPPED_BY = "codex-bridge-lease-release";
 async function cleanupManagedCodexAppServer(session, options = {}) {
   const statePath = managedCodexAppServerStatePath(session, options.stateRoot);
@@ -10051,7 +13775,7 @@ async function cleanupManagedCodexAppServer(session, options = {}) {
   }
   state.stoppedAt = (options.now ?? (() => /* @__PURE__ */ new Date()))().toISOString();
   state.stoppedBy = DEFAULT_STOPPED_BY;
-  await writeFile3(statePath, JSON.stringify(state, null, 2), "utf8");
+  await writeFile4(statePath, JSON.stringify(state, null, 2), "utf8");
   return result;
 }
 async function killTree(processManager, pid) {
@@ -10061,12 +13785,12 @@ async function killTree(processManager, pid) {
   }
   return processManager.kill(pid);
 }
-function managedCodexAppServerStatePath(session, stateRoot2 = path5.join(os5.homedir(), ".agents-comm-bus", "codex-bootstrapper")) {
-  return path5.join(stateRoot2, "sessions", `${session}.json`);
+function managedCodexAppServerStatePath(session, stateRoot2 = path9.join(os6.homedir(), ".agents-comm-bus", "codex-bootstrapper")) {
+  return path9.join(stateRoot2, "sessions", `${session}.json`);
 }
 async function readManagedAppServerState(statePath) {
   try {
-    return JSON.parse(await readFile6(statePath, "utf8"));
+    return JSON.parse(await readFile8(statePath, "utf8"));
   } catch {
     return null;
   }
@@ -10156,8 +13880,67 @@ Get-Children -ParentPid ${pid}
   }
 };
 
+// ../core-daemon/bridges/codex/wake-target-probe.ts
+async function probeCodexWakeTargetByCwd(input) {
+  const { min, max } = input.portRange;
+  const perProbeTimeoutMs = input.perProbeTimeoutMs ?? 300;
+  const concurrency = input.concurrency ?? 10;
+  const ports = [];
+  for (let port = min; port <= max; port += 1) {
+    ports.push(port);
+  }
+  const matches = [];
+  await mapWithConcurrency(ports, concurrency, async (port) => {
+    const url = `ws://127.0.0.1:${port}`;
+    const client = input.clientFactory(url);
+    try {
+      const listResult = await client.call("thread/list", {}, { timeoutMs: perProbeTimeoutMs });
+      for (const thread of liveThreadsMatchingProject(listResult, input.project)) {
+        matches.push({ port, ...thread });
+      }
+    } catch {
+    }
+  });
+  const scanned = ports.length;
+  if (matches.length === 0) {
+    return { ok: false, reason: "probe_no_match", scanned, matches: 0 };
+  }
+  if (matches.length >= 2) {
+    return {
+      ok: false,
+      reason: "probe_ambiguous",
+      scanned,
+      matches: matches.length,
+      ports: [...new Set(matches.map((match2) => match2.port))]
+    };
+  }
+  const match = matches[0];
+  return {
+    ok: true,
+    appServerUrl: `ws://127.0.0.1:${match.port}`,
+    threadId: match.threadId,
+    scanned
+  };
+}
+async function mapWithConcurrency(items, concurrency, fn) {
+  if (items.length === 0) return;
+  let index = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (index < items.length) {
+      const current = items[index];
+      index += 1;
+      await fn(current);
+    }
+  });
+  await Promise.all(workers);
+}
+
 // ../core-daemon/bridges/codex/bridge.ts
 var DEFAULT_TTL_SECONDS2 = 3600;
+var DEFAULT_CODEX_PROBE_PORT_MIN = 4500;
+var DEFAULT_CODEX_PROBE_PORT_MAX = 4600;
+var DEFAULT_CODEX_PROBE_TIMEOUT_MS = 300;
+var DEFAULT_CODEX_PROBE_CONCURRENCY = 10;
 var DEFAULT_QUERY_POLL_TIMEOUT_MS = 9 * 60 * 1e3;
 var DEFAULT_APP_SERVER_CLEANUP_DELAY_MS = 3e3;
 var DEFAULT_SESSION_OWNER_CHECK_INTERVAL_MS = 1e4;
@@ -10172,9 +13955,10 @@ var CodexBridge = class {
   constructor(options) {
     this.options = options;
     this.sessionOwnerIsLive = options.sessionOwnerIsLive ?? createSessionOwnerLiveness();
+    this.appServerClientFactory = options.appServerClientFactory ?? ((url) => new WebSocketCodexAppServerClient(url));
     this.adapter = new CodexAgentAdapter({
       defaultAppServerUrl: options.defaultAppServerUrl ?? process.env.CODEX_APP_SERVER_URL,
-      appServerClientFactory: options.appServerClientFactory
+      appServerClientFactory: this.appServerClientFactory
     });
   }
   options;
@@ -10190,6 +13974,10 @@ var CodexBridge = class {
   pendingManagedCleanups = 0;
   inFlightManagedCleanups = 0;
   sessionOwnerIsLive;
+  appServerClientFactory;
+  /** AGE-103: single-flight cwd probe keyed by comm+bot+project. */
+  inFlightCwdProbes = /* @__PURE__ */ new Map();
+  cwdProbeJoiners = /* @__PURE__ */ new Map();
   attach(comms) {
     this.options.bus.setResolveSink({
       onResolved: async (query, decision) => {
@@ -10240,11 +14028,68 @@ var CodexBridge = class {
     );
     const mostRecentConversationId = pendingForSession.at(-1)?.conversation.conversation_id ?? conversation.conversation_id;
     await this.options.storage.setSessionMostRecentInbound(session, mostRecentConversationId);
+    const sessionRecord = await this.options.storage.getSession(session);
+    if (sessionRecord) {
+      const strategy = await wakeStrategyForSession(this.options.storage, sessionRecord);
+      if (strategy === "herdr") {
+        const latest = pendingForSession.at(-1);
+        const seed = latest ? wakeSeedFromMessage({
+          comm: latest.message.chat.comm,
+          sender: latest.message.sender?.display_name ?? latest.message.sender?.id,
+          body: latest.message.text
+        }) : wakeSeedFromMessage({
+          comm: conversation.comm,
+          body: ""
+        });
+        const herdr = await herdrWake(sessionRecord, seed, {
+          storage: this.options.storage,
+          audit: this.options.audit,
+          clientFactory: this.options.herdrClientFactory,
+          conversationId: conversation.conversation_id
+        });
+        if (herdr.ok) return;
+        if (herdr.strict) return;
+      }
+    }
+    const wakeTarget = await this.resolveInboundWakeTargetFromCommLock(conversation);
+    if (!wakeTarget.ok) {
+      if (wakeTarget.reason === "comm_lease_missing_codex_target") {
+        await this.tryProbeFallbackWake(
+          conversation,
+          session,
+          pendingForSession,
+          normalizeProjectPath(conversation.project)
+        );
+        return;
+      }
+      await this.auditInboundWakeTargetFailure(
+        conversation,
+        session,
+        wakeTarget.reason,
+        pendingForSession.length
+      );
+      return;
+    }
+    await this.wakeWithResolvedTarget(
+      conversation,
+      session,
+      pendingForSession,
+      wakeTarget.project,
+      wakeTarget.appServerUrl,
+      wakeTarget.threadId,
+      "comm_lease"
+    );
+  }
+  async wakeWithResolvedTarget(conversation, session, pendingForSession, project, appServerUrl, threadId, wakeTargetSource, probeDetail = {}) {
+    this.applyRegistrationTargets(session, project, appServerUrl, threadId);
     await this.auditWake("agent_wake_attempt", conversation, session, {
-      app_server_url: this.adapter.appServerUrlFor(session),
+      app_server_url: appServerUrl,
+      thread_id: threadId,
+      wake_target_source: wakeTargetSource,
       pending_count: pendingForSession.length,
       pending_message_ids: pendingForSession.map((entry) => entry.message.message_id),
-      pending_conversation_ids: [...new Set(pendingForSession.map((entry) => entry.conversation.conversation_id))]
+      pending_conversation_ids: [...new Set(pendingForSession.map((entry) => entry.conversation.conversation_id))],
+      ...probeDetail
     });
     try {
       const result = await this.adapter.wakeOrSteer(
@@ -10253,7 +14098,7 @@ var CodexBridge = class {
       );
       if (result.ok) {
         await this.auditWake("agent_wake_succeeded", conversation, session, {
-          app_server_url: this.adapter.appServerUrlFor(session),
+          app_server_url: appServerUrl,
           method: result.method,
           thread_id: result.threadId,
           fallback_reason: result.fallbackFrom?.reason,
@@ -10263,10 +14108,30 @@ var CodexBridge = class {
           removed_pending_count: pendingForSession.length
         });
         await this.removePendingInbound(session, pendingForSession);
+        return;
       }
+      if (isCodexWakeTargetValidationFailure(result.reason)) {
+        if (wakeTargetSource === "cwd_probe") {
+          await this.auditProbeTargetValidationFailure(
+            conversation,
+            session,
+            result.reason,
+            pendingForSession.length
+          );
+          return;
+        }
+        await this.tryProbeFallbackWake(
+          conversation,
+          session,
+          pendingForSession,
+          project
+        );
+        return;
+      }
+      await this.auditWakeFailure(conversation, session, result, pendingForSession.length);
     } catch (error) {
       await this.auditWake("agent_wake_failed", conversation, session, {
-        app_server_url: this.adapter.appServerUrlFor(session),
+        app_server_url: appServerUrl,
         pending_count: pendingForSession.length,
         error: error instanceof Error ? error.message : String(error)
       });
@@ -10274,6 +14139,143 @@ var CodexBridge = class {
         `agents-comm-bus: failed to wake Codex for ${conversation.conversation_id}: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+  }
+  async tryProbeFallbackWake(conversation, session, pendingForSession, project) {
+    if (!conversation.bot_user_id) {
+      await this.auditInboundWakeTargetFailure(
+        conversation,
+        session,
+        "missing_bot_user_id",
+        pendingForSession.length
+      );
+      return;
+    }
+    const probeKey = `${conversation.comm}:${conversation.bot_user_id}:${project}`;
+    this.cwdProbeJoiners.set(probeKey, (this.cwdProbeJoiners.get(probeKey) ?? 0) + 1);
+    let probePromise;
+    try {
+      probePromise = this.getOrCreateCwdProbe(probeKey, project);
+      const probe = await probePromise;
+      if (!probe.ok) {
+        const detail = {
+          reason: probe.reason,
+          repair_required: true,
+          pending_count: pendingForSession.length,
+          probe_scanned: probe.scanned,
+          probe_matches: probe.matches,
+          probe_ports: probe.ports,
+          comm: conversation.comm,
+          bot_user_id: conversation.bot_user_id
+        };
+        await this.auditWake("agent_wake_failed", conversation, session, detail);
+        await this.auditWake("agent_wake_target_invalid", conversation, session, detail);
+        console.error(
+          `agents-comm-bus: inbound Codex cwd probe failed for ${conversation.conversation_id}: ${probe.reason}`
+        );
+        return;
+      }
+      const persist = this.options.persistHeldCommLeaseAgentProperties;
+      if (!persist) {
+        await this.auditProbePersistFailure(
+          conversation,
+          session,
+          pendingForSession.length,
+          "unavailable"
+        );
+        return;
+      }
+      const leaseProps = codexAgentLeaseProperties(probe.appServerUrl, probe.threadId);
+      if (!leaseProps) {
+        await this.auditProbePersistFailure(
+          conversation,
+          session,
+          pendingForSession.length,
+          "invalid-probe-result"
+        );
+        return;
+      }
+      const persisted = await persist(conversation.comm, conversation.bot_user_id, leaseProps);
+      if (!persisted.ok) {
+        await this.auditProbePersistFailure(
+          conversation,
+          session,
+          pendingForSession.length,
+          persisted.reason
+        );
+        return;
+      }
+      const probePort = Number(new URL(probe.appServerUrl).port);
+      await this.wakeWithResolvedTarget(
+        conversation,
+        session,
+        pendingForSession,
+        project,
+        probe.appServerUrl,
+        probe.threadId,
+        "cwd_probe",
+        {
+          probe_scanned: probe.scanned,
+          probe_port: probePort
+        }
+      );
+    } finally {
+      const remaining = (this.cwdProbeJoiners.get(probeKey) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.cwdProbeJoiners.delete(probeKey);
+        queueMicrotask(() => {
+          if ((this.cwdProbeJoiners.get(probeKey) ?? 0) === 0 && probePromise && this.inFlightCwdProbes.get(probeKey) === probePromise) {
+            this.inFlightCwdProbes.delete(probeKey);
+          }
+        });
+      } else {
+        this.cwdProbeJoiners.set(probeKey, remaining);
+      }
+    }
+  }
+  getOrCreateCwdProbe(key, project) {
+    let probe = this.inFlightCwdProbes.get(key);
+    if (probe) return probe;
+    const portRange = this.options.codexPortRange ?? {
+      min: DEFAULT_CODEX_PROBE_PORT_MIN,
+      max: DEFAULT_CODEX_PROBE_PORT_MAX
+    };
+    probe = probeCodexWakeTargetByCwd({
+      project,
+      portRange,
+      clientFactory: this.appServerClientFactory,
+      perProbeTimeoutMs: this.options.codexProbeTimeoutMs ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS,
+      concurrency: this.options.codexProbeConcurrency ?? DEFAULT_CODEX_PROBE_CONCURRENCY
+    });
+    this.inFlightCwdProbes.set(key, probe);
+    return probe;
+  }
+  async auditProbePersistFailure(conversation, session, pendingCount, reason) {
+    const detail = {
+      reason: `probe_persist_failed:${reason}`,
+      repair_required: true,
+      pending_count: pendingCount,
+      comm: conversation.comm,
+      bot_user_id: conversation.bot_user_id ?? void 0
+    };
+    await this.auditWake("agent_wake_failed", conversation, session, detail);
+    await this.auditWake("agent_wake_target_invalid", conversation, session, detail);
+    console.error(
+      `agents-comm-bus: inbound Codex probe persist failed for ${conversation.conversation_id}: ${reason}`
+    );
+  }
+  async auditProbeTargetValidationFailure(conversation, session, reason, pendingCount) {
+    const detail = {
+      reason: `probe_target_validation_failed:${reason}`,
+      repair_required: true,
+      pending_count: pendingCount,
+      comm: conversation.comm,
+      bot_user_id: conversation.bot_user_id ?? void 0
+    };
+    await this.auditWake("agent_wake_failed", conversation, session, detail);
+    await this.auditWake("agent_wake_target_invalid", conversation, session, detail);
+    console.error(
+      `agents-comm-bus: inbound Codex probe target failed validation for ${conversation.conversation_id}: ${reason}`
+    );
   }
   async handleIpcMethod(method, params, ctx) {
     switch (method) {
@@ -10318,7 +14320,8 @@ var CodexBridge = class {
         status: "active",
         lease_holder_connection_id: null,
         lease_owner_process_pid: null,
-        lease_owner_process_registered_at: null
+        lease_owner_process_registered_at: null,
+        lease_owner_process_start_time: null
       },
       sessions,
       this.sessionOwnerIsLive
@@ -10327,20 +14330,60 @@ var CodexBridge = class {
     const hasManagedSession = typeof params.managed_session_id === "string" && params.managed_session_id.trim().length > 0;
     const managedAppServerPresent = hasAppServerUrl && hasManagedSession && params.app_server_reachable === true;
     const hasAccountRegistration = scopedRegistrations.length > 0;
-    const bootstrapRequired = hasAccountRegistration && !managedAppServerPresent;
+    let bootstrapRequired = hasAccountRegistration && !managedAppServerPresent;
+    let reason = !hasAccountRegistration ? "no codex comm account registration for project" : managedAppServerPresent ? "codex session already has a reachable managed app-server url" : "codex comm account registration exists but no managed app-server url is present";
+    const herdrIdentity = parseHerdrIdentity(params.herdr_identity);
+    if (herdrIdentity?.agent === this.agentId) {
+      const wakeStrict = parseWakeStrict(params.wake_strict);
+      const stored = await this.options.storage.getSession(
+        herdrSessionId(herdrIdentity)
+      ) ?? {
+        schema_version: SCHEMA_VERSION_SESSION,
+        session_id: herdrSessionId(herdrIdentity),
+        agent: this.agentId,
+        project,
+        created_at: 0,
+        lease_holder_connection_id: null,
+        lease_acquired_at: null,
+        lease_released_at: null,
+        lease_owner_process_pid: null,
+        lease_owner_process_label: null,
+        lease_owner_process_registered_at: null,
+        lease_owner_process_start_time: null,
+        lease_owner_daemon_discovery_root: null,
+        lease_owner_daemon_checkout_root: null,
+        lease_owner_daemon_state_root: null,
+        lease_owner_daemon_bin: null,
+        lease_owner_daemon_authority_rank: null,
+        most_recent_inbound_conversation_id: null,
+        account_label_scope: accountLabelScope,
+        status: "active",
+        wake_identity: herdrIdentity,
+        wake_strict: wakeStrict
+      };
+      const mode = await resolveWakeMode(this.options.storage, project, this.agentId);
+      if (effectiveWakeStrategy(stored, mode) === "herdr") {
+        bootstrapRequired = false;
+        reason = "herdr";
+      }
+    }
     return {
       ok: true,
       has_account_registration: hasAccountRegistration,
       registration_count: scopedRegistrations.length,
       managed_app_server_present: managedAppServerPresent,
       bootstrap_required: bootstrapRequired,
-      reason: !hasAccountRegistration ? "no codex comm account registration for project" : managedAppServerPresent ? "codex session already has a reachable managed app-server url" : "codex comm account registration exists but no managed app-server url is present"
+      reason
     };
   }
   async registerSession(params, socket) {
+    const herdrParams = validateHerdrRegisterParams(params, this.agentId);
+    if (!herdrParams.ok) {
+      return { ok: false, reason: herdrParams.reason };
+    }
     const session = requiredString2(params.session, "session");
     const project = normalizeProjectPath(requiredString2(params.project, "project"));
-    const connectionId = typeof params.connection_id === "string" ? params.connection_id : `codex:${session}:${crypto5.randomUUID()}`;
+    const connectionId = typeof params.connection_id === "string" ? params.connection_id : `codex:${session}:${crypto6.randomUUID()}`;
     const now = Date.now();
     const accountLabelScope = accountLabelScopeFromParams(params);
     await this.options.storage.upsertSession({
@@ -10355,6 +14398,7 @@ var CodexBridge = class {
       lease_owner_process_pid: null,
       lease_owner_process_label: null,
       lease_owner_process_registered_at: null,
+      lease_owner_process_start_time: null,
       lease_owner_daemon_discovery_root: null,
       lease_owner_daemon_checkout_root: null,
       lease_owner_daemon_state_root: null,
@@ -10362,10 +14406,21 @@ var CodexBridge = class {
       lease_owner_daemon_authority_rank: null,
       most_recent_inbound_conversation_id: null,
       account_label_scope: accountLabelScope,
-      status: "active"
+      status: "active",
+      wake_identity: null,
+      wake_strict: null
     });
+    await applyHerdrWakeTargetFromRegisterParams(
+      this.options.storage,
+      session,
+      params,
+      this.agentId,
+      this.sessionOwnerIsLive
+    );
+    const baselineSession = await this.options.storage.getSession(session);
+    const deliverabilityBaseline = baselineSession ? this.isLocallyDeliverable(baselineSession) : false;
     const replaceExistingLease = params.replace_existing_lease === true || params.persist_after_disconnect === true;
-    const leaseOwner = this.options.daemonOwner ? sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams2(params, "codex"), this.options.daemonOwner) : sessionLeaseOwnerFromParams2(params, "codex");
+    const leaseOwner = this.options.daemonOwner ? await sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams2(params, "codex"), this.options.daemonOwner) : sessionLeaseOwnerFromParams2(params, "codex");
     let acquired = await this.options.storage.acquireSessionLease(
       session,
       connectionId,
@@ -10383,6 +14438,14 @@ var CodexBridge = class {
         );
       }
     }
+    const appServerUrl = typeof params.app_server_url === "string" ? params.app_server_url : void 0;
+    const threadId = threadIdFromRegisterParams(params);
+    const agentLeaseProperties = this.applyRegistrationTargets(
+      session,
+      project,
+      appServerUrl,
+      threadId
+    );
     if (!acquired) {
       const existing = await this.options.storage.getSession(session);
       if (existing?.lease_holder_connection_id && replaceExistingLease) {
@@ -10398,28 +14461,38 @@ var CodexBridge = class {
           leaseOwner
         );
         if (!reacquired) {
-          await this.ensureCommsBestEffort(project, accountLabelScope);
+          await this.ensureCommsBestEffort(project, accountLabelScope, agentLeaseProperties);
           return { ok: false, reason: "same-project codex session lease already held" };
         }
       } else if (existing?.lease_holder_connection_id) {
-        await this.ensureCommsBestEffort(project, accountLabelScope);
+        await this.ensureCommsBestEffort(project, accountLabelScope, agentLeaseProperties);
+        const afterWake2 = await this.options.storage.getSession(session);
+        const wake_strategy2 = afterWake2 ? await wakeStrategyForSession(this.options.storage, afterWake2) : "native";
         return {
           ok: true,
           reason: "codex session lease already held; registration refreshed",
-          capabilities: this.adapter.capabilities
+          capabilities: this.adapter.capabilities,
+          wake_strategy: wake_strategy2
         };
       } else {
-        await this.ensureCommsBestEffort(project, accountLabelScope);
+        await this.ensureCommsBestEffort(project, accountLabelScope, agentLeaseProperties);
         return { ok: false, reason: "same-project codex session lease already held" };
       }
     }
     const control = new BridgeControlChannel();
     await this.adapter.connect(session, control);
-    if (typeof params.app_server_url === "string") {
-      this.adapter.setAppServerUrl(session, params.app_server_url);
-    }
+    this.applyRegistrationTargets(session, project, appServerUrl, threadId);
     this.trackSession(project, session, accountLabelScope);
-    await this.ensureCommsBestEffort(project, accountLabelScope);
+    const rehydrated = await this.ensureCommsBestEffort(
+      project,
+      accountLabelScope,
+      agentLeaseProperties
+    );
+    const afterSession = await this.options.storage.getSession(session);
+    const deliverabilityAfter = afterSession ? this.isLocallyDeliverable(afterSession) : false;
+    if (!deliverabilityBaseline && deliverabilityAfter && rehydrated) {
+      await this.redrivePendingInbound(session);
+    }
     const persistAfterDisconnect = params.persist_after_disconnect === true;
     const manageAppServerLifecycle = params.manage_app_server_lifecycle === true || params.source === "mcp-server";
     const lease = {
@@ -10437,7 +14510,9 @@ var CodexBridge = class {
       void this.releaseSessionLease(lease);
     };
     socket?.once("close", release);
-    return { ok: true, capabilities: this.adapter.capabilities };
+    const afterWake = await this.options.storage.getSession(session);
+    const wake_strategy = afterWake ? await wakeStrategyForSession(this.options.storage, afterWake) : "native";
+    return { ok: true, capabilities: this.adapter.capabilities, wake_strategy };
   }
   async drainInbound(params) {
     const session = typeof params.session === "string" ? params.session : void 0;
@@ -10467,7 +14542,7 @@ var CodexBridge = class {
       params.prompt_text ?? queryInput.prompt_text,
       "prompt_text"
     );
-    const queryId = `q_${crypto5.randomUUID()}`;
+    const queryId = `q_${crypto6.randomUUID()}`;
     const sessionRecord = await this.options.storage.getSession(session);
     const conversation = sessionRecord?.most_recent_inbound_conversation_id ? await this.options.storage.getConversation(sessionRecord.most_recent_inbound_conversation_id) : null;
     const originChat = conversation ? await this.chatRefForConversation(conversation) : void 0;
@@ -10536,8 +14611,18 @@ var CodexBridge = class {
   async turnControl(params) {
     const session = requiredString2(params.session, "session");
     const kind = params.kind === "steer" ? "steer" : params.kind === "interrupt" ? "interrupt" : "start";
-    if (typeof params.app_server_url === "string") {
-      this.adapter.setAppServerUrl(session, params.app_server_url);
+    const appServerUrl = typeof params.app_server_url === "string" ? params.app_server_url : void 0;
+    const threadId = threadIdFromRegisterParams(params);
+    const route = this.sessionRoutes.get(session);
+    if (route && (appServerUrl || threadId)) {
+      this.adapter.setWakeTarget(session, {
+        project: route.project,
+        appServerUrl,
+        threadId
+      });
+    }
+    if (appServerUrl) {
+      this.adapter.setAppServerUrl(session, appServerUrl);
     }
     if (kind === "start") {
       await this.adapter.wake(session);
@@ -10614,16 +14699,129 @@ var CodexBridge = class {
   clearWaiter(queryId) {
     this.waiters.delete(queryId);
   }
-  async ensureCommsBestEffort(project, accountLabelScope) {
-    try {
-      await this.options.ensureCommsForSession?.(project, this.agentId, {
-        accountLabelScope: accountLabelScope ?? null
+  async resolveInboundWakeTargetFromCommLock(conversation) {
+    if (!conversation.bot_user_id) {
+      return { ok: false, reason: "missing_bot_user_id" };
+    }
+    const readHeld = this.options.readHeldCommLease;
+    if (!readHeld) {
+      return { ok: false, reason: "comm_lease_lookup_unavailable" };
+    }
+    const lookup = await readHeld(conversation.comm, conversation.bot_user_id);
+    if (!lookup.ok) {
+      return { ok: false, reason: `comm_lease_${lookup.reason}` };
+    }
+    const codex = lookup.agentProperties?.codex;
+    const appServerUrl = codex?.appServerUrl;
+    const threadId = codex?.threadId;
+    if (typeof appServerUrl !== "string" || appServerUrl.length === 0 || typeof threadId !== "string" || threadId.length === 0) {
+      return { ok: false, reason: "comm_lease_missing_codex_target" };
+    }
+    return {
+      ok: true,
+      appServerUrl,
+      threadId,
+      project: normalizeProjectPath(conversation.project)
+    };
+  }
+  async auditInboundWakeTargetFailure(conversation, session, reason, pendingCount) {
+    const detail = {
+      reason,
+      repair_required: true,
+      pending_count: pendingCount,
+      comm: conversation.comm,
+      bot_user_id: conversation.bot_user_id ?? void 0
+    };
+    await this.auditWake("agent_wake_failed", conversation, session, detail);
+    await this.auditWake("agent_wake_target_invalid", conversation, session, detail);
+    console.error(
+      `agents-comm-bus: inbound Codex wake target invalid for ${conversation.conversation_id}: ${reason}`
+    );
+  }
+  applyRegistrationTargets(session, project, appServerUrl, threadId) {
+    if (appServerUrl || threadId) {
+      this.adapter.setWakeTarget(session, {
+        project,
+        appServerUrl,
+        threadId
       });
+    }
+    if (appServerUrl) {
+      this.adapter.setAppServerUrl(session, appServerUrl);
+    }
+    return codexAgentLeaseProperties(appServerUrl, threadId);
+  }
+  async ensureCommsBestEffort(project, accountLabelScope, agentLeaseProperties) {
+    const hook = this.options.ensureCommsForSession;
+    if (!hook) return false;
+    try {
+      const result = await hook(project, this.agentId, {
+        accountLabelScope: accountLabelScope ?? null,
+        agentLeaseProperties
+      });
+      return result.rehydrated;
     } catch (error) {
       console.error(
         `agents-comm-bus: ensureCommsForSession failed for ${project}/${this.agentId}: ${error instanceof Error ? error.message : String(error)}`
       );
+      return false;
     }
+  }
+  /** AGE-91: daemon-local route = a tracked app-server route for this session. */
+  routeReady(sessionId) {
+    return this.sessionRoutes.has(sessionId);
+  }
+  isLocallyDeliverable(session) {
+    return isSessionLocallyDeliverable(
+      session,
+      this.routeReady(session.session_id),
+      this.sessionOwnerIsLive
+    );
+  }
+  /**
+   * AGE-90: after a deliverability edge with confirmed rehydration, wake once
+   * via the newest in-scope pending row. `pendingInboundForConversation`
+   * aggregates every owned-account entry in the project for one steer attempt.
+   */
+  async redrivePendingInbound(sessionId) {
+    const sess = await this.options.storage.getSession(sessionId);
+    if (!sess) return;
+    const [registrations, sessions] = await Promise.all([
+      this.options.storage.listAccountRegistrations({
+        project: sess.project,
+        agent: this.agentId
+      }),
+      this.options.storage.listSessions({
+        project: sess.project,
+        agent: this.agentId,
+        status: "active"
+      })
+    ]);
+    const scopedRegs = filterRegistrationsForSession(
+      registrations,
+      sess,
+      sessions,
+      this.sessionOwnerIsLive
+    );
+    const ownedKeys = new Set(
+      scopedRegs.map((reg) => `${reg.comm}:${reg.bot_user_id}`)
+    );
+    const inScope = this.options.pendingInbound.filter((entry) => {
+      if (entry.conversation.project !== sess.project) return false;
+      if (entry.conversation.agent !== this.agentId) return false;
+      if (!ownedKeys.has(accountKey2(entry))) return false;
+      return sessionOwnsConversation(
+        sess,
+        sessions,
+        entry.conversation,
+        this.sessionOwnerIsLive
+      );
+    });
+    if (inScope.length === 0) return;
+    const seed = inScope.reduce(
+      (latest, entry) => entry.message.received_at > latest.message.received_at ? entry : latest
+    );
+    await this.onInboundConversation(seed.conversation);
   }
   trackSession(project, session, accountLabelScope) {
     this.sessionRoutes.set(session, {
@@ -10638,29 +14836,23 @@ var CodexBridge = class {
   }
   async resolveSessionForConversation(conversation) {
     const project = normalizeProjectPath(conversation.project);
-    const inMemory = [...this.sessionRoutes.entries()].filter(([, route]) => route.project === project).map(([sessionId, route]) => ({
-      session_id: sessionId,
-      project: route.project,
-      agent: this.agentId,
-      account_label_scope: route.account_label_scope
-    }));
-    const fromMemory = resolveSessionForConversation(
-      inMemory,
-      conversation,
-      (sess) => sess.session_id
-    );
-    if (fromMemory) return fromMemory.session_id;
-    const sessions = await this.options.storage.listSessions({
+    const session = await selectActiveSessionForInboundWake(
+      this.options.storage,
       project,
-      agent: this.agentId,
-      status: "active"
-    });
-    const live = sessions.filter((sess) => sess.lease_holder_connection_id != null);
-    const pool = live.length > 0 ? live : sessions;
-    const hydrated = resolveSessionForConversation(pool, conversation, (sess) => sess.session_id);
-    if (!hydrated) return void 0;
-    this.trackSession(project, hydrated.session_id, hydrated.account_label_scope);
-    return hydrated.session_id;
+      this.agentId,
+      conversation,
+      sessionLeaseHeld
+    );
+    if (!session) return void 0;
+    this.trackSession(project, session.session_id, session.account_label_scope);
+    return session.session_id;
+  }
+  onHerdrPaneRegistered(session) {
+    this.trackSession(
+      normalizeProjectPath(session.project),
+      session.session_id,
+      session.account_label_scope
+    );
   }
   async releaseSessionLease(input) {
     if (input.released) return;
@@ -10764,6 +14956,7 @@ var CodexBridge = class {
         sessionEndObservation(latest),
         Date.now()
       );
+      this.options.requestScopeReconcile?.();
     } catch (error) {
       console.error(
         `agents-comm-bus: failed to cleanup Codex app-server for ${session}: ${error instanceof Error ? error.message : String(error)}`
@@ -10817,6 +15010,23 @@ var CodexBridge = class {
         `agents-comm-bus: failed to audit Codex wake event for ${conversation.conversation_id}: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+  }
+  async auditWakeFailure(conversation, session, result, pendingCount) {
+    const detail = {
+      app_server_url: this.adapter.appServerUrlFor(session),
+      pending_count: pendingCount,
+      reason: result.reason,
+      error: result.error,
+      thread_id: result.threadId,
+      repair_required: isCodexWakeTargetValidationFailure(result.reason)
+    };
+    await this.auditWake("agent_wake_failed", conversation, session, detail);
+    if (isCodexWakeTargetValidationFailure(result.reason)) {
+      await this.auditWake("agent_wake_target_invalid", conversation, session, detail);
+    }
+    console.error(
+      `agents-comm-bus: failed to wake Codex for ${conversation.conversation_id}: ${result.reason}${result.error ? `: ${result.error}` : ""}`
+    );
   }
   async pendingInboundForConversation(conversation, session) {
     const owned = await this.ownedAccountKeys(session);
@@ -10972,6 +15182,22 @@ function ackTextFor2(decision) {
       return "Recorded";
   }
 }
+function codexAgentLeaseProperties(appServerUrl, threadId) {
+  if (!appServerUrl || !threadId) return void 0;
+  return {
+    codex: {
+      appServerUrl,
+      threadId
+    }
+  };
+}
+function threadIdFromRegisterParams(params) {
+  const direct = params.thread_id ?? params.threadId;
+  if (typeof direct === "string" && direct.length > 0) return direct;
+  const codex = recordOrEmpty3(params.codex);
+  const fromHook = codex.thread_id ?? codex.threadId ?? codex.session_id ?? codex.sessionId;
+  return typeof fromHook === "string" && fromHook.length > 0 ? fromHook : void 0;
+}
 function requiredString2(paramsValue, name) {
   if (typeof paramsValue !== "string" || paramsValue.length === 0) {
     throw new Error(`${name} is required`);
@@ -10986,7 +15212,8 @@ function sessionLeaseOwnerFromParams2(params, fallbackLabel) {
   if (!pid) return void 0;
   return {
     process_pid: pid,
-    process_label: typeof params.owner_process_label === "string" ? params.owner_process_label : fallbackLabel
+    process_label: typeof params.owner_process_label === "string" ? params.owner_process_label : fallbackLabel,
+    process_start_time: numberParam2(params.owner_process_start_time)
   };
 }
 function numberParam2(value) {
@@ -11015,6 +15242,10 @@ var BridgeControlChannel = class {
   }
 };
 var CodexBridgeFactory = class {
+  constructor(factoryOptions = {}) {
+    this.factoryOptions = factoryOptions;
+  }
+  factoryOptions;
   agentId = "codex";
   create(context) {
     return new CodexBridge({
@@ -11024,7 +15255,13 @@ var CodexBridgeFactory = class {
       pendingInbound: context.pendingInbound,
       ensureCommsForSession: context.ensureCommsForSession,
       daemonOwner: context.daemonOwner,
-      sessionOwnerIsLive: context.sessionOwnerIsLive
+      sessionOwnerIsLive: context.sessionOwnerIsLive,
+      readHeldCommLease: context.readHeldCommLease,
+      persistHeldCommLeaseAgentProperties: context.persistHeldCommLeaseAgentProperties,
+      codexPortRange: this.factoryOptions.codexPortRange,
+      codexProbeTimeoutMs: this.factoryOptions.codexProbeTimeoutMs,
+      codexProbeConcurrency: this.factoryOptions.codexProbeConcurrency,
+      requestScopeReconcile: context.requestScopeReconcile
     });
   }
 };
@@ -11044,6 +15281,8 @@ var PiBridge = class {
   agentId = "pi";
   ipcMethods = PI_IPC_METHODS;
   sessionOwnerIsLive;
+  /** Non-strict herdr wake failed — allow poll drain until the next successful herdr wake. */
+  herdrPollFallback = /* @__PURE__ */ new Set();
   attach(_comms) {
   }
   async handleIpcMethod(method, params, ctx) {
@@ -11107,6 +15346,10 @@ var PiBridge = class {
     }
   }
   async registerSession(params, socket) {
+    const herdrParams = validateHerdrRegisterParams(params, this.agentId);
+    if (!herdrParams.ok) {
+      return { ok: false, reason: herdrParams.reason };
+    }
     const session = requiredString3(params.session, "session");
     const project = normalizeProjectPath(requiredString3(params.project, "project"));
     const connectionId = requiredString3(params.connection_id, "connection_id");
@@ -11124,6 +15367,7 @@ var PiBridge = class {
       lease_owner_process_pid: null,
       lease_owner_process_label: null,
       lease_owner_process_registered_at: null,
+      lease_owner_process_start_time: null,
       lease_owner_daemon_discovery_root: null,
       lease_owner_daemon_checkout_root: null,
       lease_owner_daemon_state_root: null,
@@ -11131,9 +15375,18 @@ var PiBridge = class {
       lease_owner_daemon_authority_rank: null,
       most_recent_inbound_conversation_id: null,
       account_label_scope: accountLabelScope,
-      status: "active"
+      status: "active",
+      wake_identity: null,
+      wake_strict: null
     });
-    const leaseOwner = this.options.daemonOwner ? sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams3(params), this.options.daemonOwner) : sessionLeaseOwnerFromParams3(params);
+    await applyHerdrWakeTargetFromRegisterParams(
+      this.options.storage,
+      session,
+      params,
+      this.agentId,
+      this.sessionOwnerIsLive
+    );
+    const leaseOwner = this.options.daemonOwner ? await sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams3(params), this.options.daemonOwner) : sessionLeaseOwnerFromParams3(params);
     const acquired = await this.options.storage.acquireSessionLease(
       session,
       connectionId,
@@ -11152,13 +15405,81 @@ var PiBridge = class {
       );
     });
     await this.ensureCommsBestEffort(project, accountLabelScope);
-    return { ok: true, session, project, agent: "pi" };
+    const afterWake = await this.options.storage.getSession(session);
+    const wake_strategy = afterWake ? await wakeStrategyForSession(this.options.storage, afterWake) : "native";
+    return { ok: true, session, project, agent: "pi", wake_strategy };
+  }
+  /**
+   * AGE-91: Pi is route-ready by construction once a session is registered.
+   * Herdr wake is push-based; native delivery remains pull-based via drain.
+   */
+  routeReady(_session) {
+    return true;
+  }
+  async onInboundConversation(conversation, message) {
+    if (conversation.agent !== this.agentId) return;
+    const session = await this.resolveSessionForConversation(conversation);
+    if (!session) return;
+    const owned = await this.ownedAccountKeys(session);
+    const pendingForSession = this.options.pendingInbound.filter(
+      (entry) => owned.has(accountKey3(entry))
+    );
+    const mostRecentConversationId = pendingForSession.at(-1)?.conversation.conversation_id ?? conversation.conversation_id;
+    await this.options.storage.setSessionMostRecentInbound(
+      session,
+      mostRecentConversationId
+    );
+    const sessionRecord = await this.options.storage.getSession(session);
+    if (!sessionRecord) return;
+    const strategy = await wakeStrategyForSession(
+      this.options.storage,
+      sessionRecord
+    );
+    if (strategy !== "herdr") return;
+    const latest = pendingForSession.at(-1);
+    const seed = latest ? wakeSeedFromMessage({
+      comm: latest.message.chat.comm,
+      sender: latest.message.sender?.display_name ?? latest.message.sender?.id,
+      body: latest.message.text
+    }) : wakeSeedFromMessage({
+      comm: message?.chat.comm ?? conversation.comm,
+      sender: message?.sender?.display_name ?? message?.sender?.id,
+      body: message?.text
+    });
+    const herdr = await herdrWake(sessionRecord, seed, {
+      storage: this.options.storage,
+      audit: this.options.audit,
+      clientFactory: this.options.herdrClientFactory,
+      conversationId: conversation.conversation_id
+    });
+    if (herdr.ok) {
+      this.herdrPollFallback.delete(session);
+      return;
+    }
+    if (!herdr.strict) {
+      this.herdrPollFallback.add(session);
+    }
+  }
+  async resolveSessionForConversation(conversation) {
+    const session = await selectActiveSessionForInboundWake(
+      this.options.storage,
+      conversation.project,
+      this.agentId,
+      conversation,
+      sessionLeaseHeld
+    );
+    return session?.session_id;
   }
   async drainInbound(params) {
     const session = requiredString3(params.session, "session");
     const sess = await this.options.storage.getSession(session);
     if (!sess) return { messages: [] };
     this.assertCallerProjectMatchesStored(session, sess.project, params);
+    const trigger = params.trigger === "prompt" || params.trigger === "poll" ? params.trigger : "poll";
+    const strategy = await wakeStrategyForSession(this.options.storage, sess);
+    if (trigger === "poll" && strategy === "herdr" && !this.herdrPollFallback.has(session)) {
+      return { messages: [] };
+    }
     const owned = await this.ownedAccountKeys(session);
     const commFilter = typeof params.comm === "string" && params.comm.length > 0 ? params.comm : null;
     const limit = typeof params.limit === "number" && Number.isInteger(params.limit) && params.limit > 0 ? params.limit : null;
@@ -11196,6 +15517,7 @@ var PiBridge = class {
       sessionEndObservation(sess),
       Date.now()
     );
+    this.options.requestScopeReconcile?.();
     return { ok: true };
   }
 };
@@ -11212,10 +15534,12 @@ function sessionLeaseOwnerFromParams3(params) {
   const host = params.host && typeof params.host === "object" && !Array.isArray(params.host) ? params.host : null;
   const pid = numberParam3(host?.pid ?? params.owner_process_pid);
   if (!pid) return void 0;
+  const startTime = numberParam3(host?.start_time ?? params.owner_process_start_time);
   const label = typeof host?.label === "string" ? host.label : typeof params.owner_process_label === "string" ? params.owner_process_label : "pi";
   return {
     process_pid: pid,
-    process_label: label
+    process_label: label,
+    process_start_time: startTime
   };
 }
 function numberParam3(value) {
@@ -11234,14 +15558,15 @@ var PiBridgeFactory = class {
       pendingInbound: context.pendingInbound,
       ensureCommsForSession: context.ensureCommsForSession,
       daemonOwner: context.daemonOwner,
-      sessionOwnerIsLive: context.sessionOwnerIsLive
+      sessionOwnerIsLive: context.sessionOwnerIsLive,
+      requestScopeReconcile: context.requestScopeReconcile
     });
   }
 };
 
 // ../core-daemon/runtime/comm-adapter-loader.ts
-import { readdir, stat as stat4 } from "node:fs/promises";
-import path6 from "node:path";
+import { readdir as readdir2, stat as stat6 } from "node:fs/promises";
+import path10 from "node:path";
 import { pathToFileURL } from "node:url";
 function defaultOnError({ modulePath, error }) {
   const message = error instanceof Error ? error.message : String(error);
@@ -11251,7 +15576,7 @@ async function loadCommAdapterFactories(options) {
   const onError = options.onError ?? defaultOnError;
   let entries;
   try {
-    entries = await readdir(options.adaptersDir);
+    entries = await readdir2(options.adaptersDir);
   } catch (error) {
     if (error.code === "ENOENT") return [];
     throw error;
@@ -11279,16 +15604,16 @@ async function loadCommAdapterFactories(options) {
   return factories;
 }
 async function resolveAdapterModulePath(adaptersDir, entry) {
-  const entryPath = path6.join(adaptersDir, entry);
+  const entryPath = path10.join(adaptersDir, entry);
   if (entry.endsWith(".js")) return entryPath;
   try {
-    if (!(await stat4(entryPath)).isDirectory()) return null;
+    if (!(await stat6(entryPath)).isDirectory()) return null;
   } catch {
     return null;
   }
-  const factoryPath = path6.join(entryPath, "factory.js");
+  const factoryPath = path10.join(entryPath, "factory.js");
   try {
-    if ((await stat4(factoryPath)).isFile()) return factoryPath;
+    if ((await stat6(factoryPath)).isFile()) return factoryPath;
   } catch {
     return null;
   }
@@ -11322,6 +15647,19 @@ function assertCommAdapterFactory(modulePath, value) {
 }
 
 // ../core-daemon/serve.ts
+var DEFAULT_CODEX_PROBE_PORT_RANGE = { min: 4500, max: 4600 };
+function parseCodexPortRangeFromEnv(env = process.env) {
+  const raw = env.AGENTS_COMM_BUS_CODEX_PORT_RANGE?.trim();
+  if (!raw) return DEFAULT_CODEX_PROBE_PORT_RANGE;
+  const match = /^(\d+)-(\d+)$/.exec(raw);
+  if (!match) return DEFAULT_CODEX_PROBE_PORT_RANGE;
+  const min = Number(match[1]);
+  const max = Number(match[2]);
+  if (!Number.isInteger(min) || !Number.isInteger(max) || min <= 0 || max < min) {
+    return DEFAULT_CODEX_PROBE_PORT_RANGE;
+  }
+  return { min, max };
+}
 async function startConfiguredDaemon() {
   process.title = `${DAEMON_NAME} daemon`;
   const paths = resolveStatePaths({ stateRoot: process.env.AGENTS_COMM_BUS_STATE_ROOT });
@@ -11333,19 +15671,19 @@ async function startConfiguredDaemon() {
     loadCommAdapterFactories: () => loadCommAdapterFactories({ adaptersDir }),
     agentBridgeFactories: [
       new ClaudeBridgeFactory(),
-      new CodexBridgeFactory(),
+      new CodexBridgeFactory({ codexPortRange: parseCodexPortRangeFromEnv() }),
       new PiBridgeFactory()
     ]
   });
 }
 function resolveAdaptersDir(stateRoot2, env) {
   if (env.AGENTS_COMM_BUS_ADAPTERS_DIR) {
-    return path7.resolve(env.AGENTS_COMM_BUS_ADAPTERS_DIR);
+    return path11.resolve(env.AGENTS_COMM_BUS_ADAPTERS_DIR);
   }
   if (env.AGENTS_COMM_BUS_BIN) {
-    return path7.resolve(path7.dirname(env.AGENTS_COMM_BUS_BIN), "..", "adapters");
+    return path11.resolve(path11.dirname(env.AGENTS_COMM_BUS_BIN), "..", "adapters");
   }
-  return path7.join(stateRoot2, "adapters");
+  return path11.join(stateRoot2, "adapters");
 }
 if (process.argv[1] && import.meta.url === pathToFileURL2(process.argv[1]).href) {
   startConfiguredDaemon().catch((error) => {
