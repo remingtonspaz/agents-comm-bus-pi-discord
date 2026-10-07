@@ -1,6 +1,6 @@
 {
   "name": "@agents-comm-bus/pi-discord",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Pi host extension for agents-comm-bus — discord comm (bundles the shared pi-core).",
   "type": "module",
   "keywords": [
@@ -16,7 +16,7 @@
     ]
   },
   "dependencies": {
-    "@agents-comm-bus/pi-core": "git+https://github.com/remingtonspaz/agents-comm-bus-pi-core.git#5c452e070a01db2d2d1b1aba622b0a13bbadad85"
+    "@agents-comm-bus/pi-core": "git+https://github.com/remingtonspaz/agents-comm-bus-pi-core.git#2d2f1d6a65699e7e08603fae6025fa0799aff2cc"
   },
   "bundledDependencies": [
     "@agents-comm-bus/pi-core"
